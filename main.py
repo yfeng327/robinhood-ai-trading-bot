@@ -5,7 +5,7 @@ import asyncio
 
 from config import *
 from src.api import robinhood
-from src.api import openai
+from src.api import ai
 from src.utils import logger
 
 
@@ -70,9 +70,9 @@ def make_ai_decisions(account_info, portfolio_overview, watchlist_overview):
         "- Return an empty array if no actions are necessary."
     )
     logger.debug(f"AI making-decisions prompt:{chr(10)}{ai_prompt}")
-    ai_response = openai.make_ai_request(ai_prompt)
-    logger.debug(f"AI making-decisions response:{chr(10)}{ai_response.choices[0].message.content.strip()}")
-    decisions = openai.parse_ai_response(ai_response)
+    ai_response = ai.make_ai_request(ai_prompt)
+    logger.debug(f"AI making-decisions response:{chr(10)}{ai.get_raw_response_content(ai_response)}")
+    decisions = ai.parse_ai_response(ai_response)
     return decisions
 
 
@@ -282,8 +282,41 @@ def trading_bot():
     return trading_results
 
 
+# Run backtest mode
+async def run_backtest_mode():
+    """Run the backtest using historical data."""
+    from src.backtest.engine import run_backtest
+
+    logger.info("Starting backtest mode...")
+
+    results = await run_backtest(
+        symbols=BACKTEST_SYMBOLS,
+        start_date=BACKTEST_START_DATE,
+        end_date=BACKTEST_END_DATE,
+        starting_cash=BACKTEST_STARTING_CASH,
+        transaction_fee=BACKTEST_TRANSACTION_FEE,
+        portfolio_limit=PORTFOLIO_LIMIT,
+        min_buy_amount=MIN_BUYING_AMOUNT_USD if MIN_BUYING_AMOUNT_USD else 0,
+        max_buy_amount=MAX_BUYING_AMOUNT_USD if MAX_BUYING_AMOUNT_USD else float('inf'),
+        min_sell_amount=MIN_SELLING_AMOUNT_USD if MIN_SELLING_AMOUNT_USD else 0,
+        max_sell_amount=MAX_SELLING_AMOUNT_USD if MAX_SELLING_AMOUNT_USD else float('inf'),
+    )
+
+    if "error" in results:
+        logger.error(f"Backtest failed: {results['error']}")
+    else:
+        logger.info("Backtest completed successfully!")
+
+    return results
+
+
 # Run trading bot in a loop
 async def main():
+    # Handle backtest mode separately
+    if MODE == "backtest":
+        await run_backtest_mode()
+        return
+
     robinhood_token_expiry = 0
 
     while True:

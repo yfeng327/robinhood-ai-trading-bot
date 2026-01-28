@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(pip install:*)",
+      "Bash(python main.py:*)",
+      "Bash(timeout:*)",
+      "Bash(ping:*)",
+      "Bash(\"yes\")",
+      "Bash(printf:*)",
+      "Bash(python:*)",
+      "WebSearch",
+      "Skill(planning-with-files)"
+    ]
+  }
+}

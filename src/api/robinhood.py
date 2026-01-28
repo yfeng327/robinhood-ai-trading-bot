@@ -23,21 +23,29 @@ async def login_to_robinhood():
         if not mfa_code and OP_SERVICE_ACCOUNT_NAME and OP_SERVICE_ACCOUNT_TOKEN and OP_VAULT_NAME and OP_ITEM_NAME:
             mfa_code = await onepassword.get_mfa_code_from_1password()
 
-        try:
-            if mfa_code:
-                logger.debug("Attempting to login to Robinhood with MFA...")
-                login_resp = rh.login(ROBINHOOD_USERNAME, ROBINHOOD_PASSWORD, mfa_code=mfa_code)
-                logger.debug("Robinhood login successful with MFA.")
-            else:
-                logger.debug("Attempting to login to Robinhood without MFA...")
-                login_resp = rh.login(ROBINHOOD_USERNAME, ROBINHOOD_PASSWORD)
-                logger.debug("Robinhood login successful without MFA.")
-            if not login_resp:
-                raise Exception("Login failed - no response received")
-            return login_resp
-        except Exception as e:
-            logger.error(f"Failed to login to Robinhood: {e}")
+        if mfa_code:
+            logger.debug("Attempting to login to Robinhood with MFA...")
+            login_resp = rh.login(ROBINHOOD_USERNAME, ROBINHOOD_PASSWORD, mfa_code=mfa_code)
+        else:
+            logger.debug("Attempting to login to Robinhood without MFA...")
+            login_resp = rh.login(ROBINHOOD_USERNAME, ROBINHOOD_PASSWORD)
+
+        logger.debug(f"Robinhood login response: {login_resp}")
+
+        if not login_resp:
+            logger.error("Login failed - no response received")
             return None
+        if 'access_token' in login_resp and 'expires_in' in login_resp:
+            # Login successful - detail field may be present with info message
+            if 'detail' in login_resp:
+                logger.debug(f"Login info: {login_resp['detail']}")
+            logger.debug("Robinhood login successful.")
+            return login_resp
+        if 'detail' in login_resp:
+            logger.error(f"Login failed - {login_resp['detail']}")
+            return None
+        logger.error(f"Login failed - unexpected response: {login_resp}")
+        return None
 
     except Exception as e:
         logger.error(f"An error occurred during Robinhood login: {e}")

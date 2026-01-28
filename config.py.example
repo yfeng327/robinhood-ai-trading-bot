@@ -4,16 +4,28 @@ OP_SERVICE_ACCOUNT_TOKEN = ""               # 1Password service account token (f
 OP_VAULT_NAME = ""                          # 1Password vault name (for Robinhood MFA secret)
 OP_ITEM_NAME = ""                           # 1Password item name (for Robinhood MFA secret)
 
-# Credentials
-OPENAI_API_KEY = "..."                      # OpenAI API key
+# AI Provider Credentials
+AI_PROVIDER = "gemini"                      # AI provider ("openai", "anthropic", or "gemini")
+OPENAI_API_KEY = ""                         # OpenAI API key (if using openai)
+ANTHROPIC_API_KEY = ""                      # Anthropic API key (if using anthropic)
+GEMINI_API_KEY = "..."                      # Google Gemini API key (if using gemini)
+
+# Robinhood Credentials
 ROBINHOOD_USERNAME = "..."                  # Robinhood username
 ROBINHOOD_PASSWORD = "..."                  # Robinhood password
 ROBINHOOD_MFA_SECRET = ""                   # Robinhood MFA secret (if enabled)
 
 # Basic config parameters
-MODE = "demo"                               # Trading mode (demo, auto, manual)
+MODE = "demo"                               # Trading mode (demo, auto, manual, backtest)
 LOG_LEVEL = "INFO"                          # Log level (DEBUG, INFO, WARNING, ERROR)
 RUN_INTERVAL_SECONDS = 600                  # Trading interval in seconds (if the market is open)
+
+# Backtest config parameters (only used when MODE = "backtest")
+BACKTEST_START_DATE = "2025-01-01"          # Backtest start date (YYYY-MM-DD)
+BACKTEST_END_DATE = "2025-06-30"            # Backtest end date (YYYY-MM-DD)
+BACKTEST_STARTING_CASH = 10000.0            # Starting cash for backtest
+BACKTEST_TRANSACTION_FEE = 0.0              # Transaction fee as decimal (0.001 = 0.1%)
+BACKTEST_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]  # Stocks to include in backtest
 
 # Robinhood config parameters
 TRADE_EXCEPTIONS = []                       # List of stocks to exclude from trading (e.g. ["AAPL", "TSLA", "AMZN"])
@@ -25,5 +37,7 @@ MAX_SELLING_AMOUNT_USD = 10.0               # Maximum sell amount in USD (False 
 MIN_BUYING_AMOUNT_USD = 1.0                 # Minimum buy amount in USD (False - disable setting)
 MAX_BUYING_AMOUNT_USD = 10.0                # Maximum buy amount in USD (False - disable setting)
 
-# OpenAI config params
-OPENAI_MODEL_NAME = "gpt-4o-mini"           # OpenAI model name
+# AI Model config params
+OPENAI_MODEL_NAME = "gpt-4o-mini"           # OpenAI model name (if using openai)
+ANTHROPIC_MODEL_NAME = "claude-opus-4-5-20251101"  # Anthropic model name (if using anthropic)
+GEMINI_MODEL_NAME = "gemini-2.0-flash"      # Google Gemini model name (if using gemini)
