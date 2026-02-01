@@ -178,6 +178,46 @@ def enrich_with_vwap(stock_data, historical_data, symbol):
     return stock_data
 
 
+# Enrich stock data with Relative Volume (RVOL)
+def enrich_with_relative_volume(stock_data, historical_data_day, historical_data_year, symbol):
+    """
+    Calculate relative volume: today's volume vs average daily volume, adjusted for time of day.
+    1.0 = average, >1.0 = above average activity, <1.0 = below average.
+    """
+    if not historical_data_day or not historical_data_year:
+        return stock_data
+
+    try:
+        # Today's cumulative volume from 5-min bars
+        today_volume = sum(int(bar.get('volume', 0)) for bar in historical_data_day)
+        if today_volume == 0:
+            return stock_data
+
+        # Average daily volume from yearly data
+        yearly_volumes = [int(day.get('volume', 0)) for day in historical_data_year if int(day.get('volume', 0)) > 0]
+        if not yearly_volumes:
+            return stock_data
+        avg_daily_volume = sum(yearly_volumes) / len(yearly_volumes)
+        if avg_daily_volume == 0:
+            return stock_data
+
+        # Adjust for time of day: trading day has ~78 five-min bars (6.5 hrs)
+        bars_elapsed = len(historical_data_day)
+        total_bars = 78
+        if bars_elapsed < total_bars:
+            # Extrapolate today's volume to a full day
+            projected_volume = today_volume * (total_bars / bars_elapsed)
+        else:
+            projected_volume = today_volume
+
+        relative_volume = round(projected_volume / avg_daily_volume, 2)
+        stock_data["relative_volume"] = relative_volume
+    except Exception:
+        pass
+
+    return stock_data
+
+
 # Enrich stock data with Moving average (MA)
 def enrich_with_moving_averages(stock_data, historical_data, symbol):
     if len(historical_data) < 200:
@@ -201,6 +241,72 @@ def enrich_with_analyst_ratings(stock_data, ratings_data):
         "text": rating['text'].decode('utf-8'),
     }, ratings_data['ratings']))
     return stock_data
+
+
+# Build compressed intraday price+volume summary for LLM prompt
+def build_intraday_summary(historical_data_day, symbol):
+    """
+    Aggregate 5-min bars into ~30-min buckets and return a compact markdown table.
+
+    Returns a string like:
+    | Time | O | H | L | C | Vol% |
+    |------|---|---|---|---|------|
+    | 09:30 | 150.2 | 151.0 | 149.8 | 150.5 | 142% |
+    ...
+
+    Vol% = this period's volume relative to average period volume.
+    Returns empty string if insufficient data.
+    """
+    if not historical_data_day or len(historical_data_day) < 6:
+        return ""
+
+    try:
+        bars_per_bucket = 6  # 6 x 5min = 30min
+        buckets = []
+
+        for i in range(0, len(historical_data_day), bars_per_bucket):
+            chunk = historical_data_day[i:i + bars_per_bucket]
+            if not chunk:
+                break
+
+            open_price = float(chunk[0].get('open_price', 0))
+            high_price = max(float(b.get('high_price', 0)) for b in chunk)
+            low_price = min(float(b.get('low_price', 0)) for b in chunk if float(b.get('low_price', 0)) > 0)
+            close_price = float(chunk[-1].get('close_price', 0))
+            volume = sum(int(b.get('volume', 0)) for b in chunk)
+
+            # Extract time from begins_at
+            begins_at = chunk[0].get('begins_at', '')
+            if 'T' in begins_at:
+                time_part = begins_at.split('T')[1][:5]  # HH:MM
+            else:
+                time_part = f"{i // bars_per_bucket * 30 // 60 + 9}:{i // bars_per_bucket * 30 % 60:02d}"
+
+            buckets.append({
+                'time': time_part,
+                'o': open_price,
+                'h': high_price,
+                'l': low_price,
+                'c': close_price,
+                'vol': volume
+            })
+
+        if not buckets:
+            return ""
+
+        # Calculate average bucket volume for Vol%
+        volumes = [b['vol'] for b in buckets]
+        avg_vol = sum(volumes) / len(volumes) if volumes else 1
+
+        # Build markdown table
+        lines = [f"**{symbol} Intraday (30-min):**", "| Time | O | H | L | C | Vol% |", "|------|---|---|---|---|------|"]
+        for b in buckets:
+            vol_pct = int(b['vol'] / avg_vol * 100) if avg_vol > 0 else 0
+            lines.append(f"| {b['time']} | {b['o']:.2f} | {b['h']:.2f} | {b['l']:.2f} | {b['c']:.2f} | {vol_pct}% |")
+
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 # Get PDT restrictions for a stock by symbol

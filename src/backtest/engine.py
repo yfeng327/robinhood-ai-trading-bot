@@ -11,8 +11,8 @@ import pandas as pd
 from .portfolio import VirtualPortfolio
 from .metrics import calculate_metrics, format_report
 from ..utils import logger
-from ..kb import KBWriter, KBReader, DecisionAnalyzer
-from ..kb.analyzer import analyze_day_decisions
+from ..kb import KBWriter, KBReader, DecisionAnalyzer, TradePlanner, cleanup_kb, log_kb_state
+from ..kb.analyzer import analyze_day_decisions, analyze_day_with_statistics
 
 
 class BacktestEngine:
@@ -35,6 +35,7 @@ class BacktestEngine:
         min_sell_amount: float = 1.0,
         max_sell_amount: float = 10.0,
         enable_kb: bool = True,
+        clean_kb: bool = False,
     ):
         """
         Initialize the backtest engine.
@@ -51,6 +52,7 @@ class BacktestEngine:
             min_sell_amount: Minimum sell amount in USD
             max_sell_amount: Maximum sell amount in USD
             enable_kb: Whether to enable Knowledge Base tracking
+            clean_kb: Whether to clean KB before starting (fresh run)
         """
         self.symbols = symbols
         self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
@@ -70,6 +72,13 @@ class BacktestEngine:
         # Knowledge Base integration
         self.enable_kb = enable_kb
         if enable_kb:
+            # Clean KB if requested (fresh backtest run)
+            if clean_kb:
+                logger.info("Cleaning KB for fresh backtest run...")
+                cleanup_kb(kb_root="kb", preserve_strategies=True)
+
+            # Log current KB state
+            log_kb_state(kb_root="kb")
             self.kb_writer = KBWriter("kb")
             self.kb_reader = KBReader("kb")
             self.decision_analyzer = DecisionAnalyzer(
@@ -78,10 +87,13 @@ class BacktestEngine:
                 min_sell=min_sell_amount,
                 max_sell=max_sell_amount
             )
+            # Trade planner for planning-with-files methodology
+            self.trade_planner = TradePlanner("kb")
 
         # Track decisions for KB analysis
         self.daily_decisions: Dict[str, List[dict]] = {}  # date -> decisions
         self.daily_stock_data: Dict[str, Dict[str, dict]] = {}  # date -> stock_data
+        self.trade_action_count: int = 0  # For 2-action rule
 
     def fetch_historical_data(self):
         """
@@ -362,8 +374,16 @@ class BacktestEngine:
 
         return filtered
 
-    def execute_decisions(self, date: str, decisions: List[dict], prices: Dict[str, float]):
-        """Execute trading decisions."""
+    def execute_decisions(self, date: str, decisions: List[dict], prices: Dict[str, float], stock_data: Dict[str, dict]):
+        """
+        Execute trading decisions with planning-with-files methodology.
+
+        For each trade:
+        1. CREATE PLAN FIRST - Build trade plan with 5-question check
+        2. READ BEFORE DECIDE - Validate plan, check for blocked trades
+        3. EXECUTE - Run the trade
+        4. UPDATE AFTER ACT - Record outcome immediately
+        """
         for decision in decisions:
             symbol = decision['symbol']
             decision_type = decision['decision']
@@ -373,24 +393,132 @@ class BacktestEngine:
             if not price:
                 continue
 
+            if decision_type not in ['buy', 'sell']:
+                continue
+
+            # ===== Phase 1: CREATE PLAN FIRST =====
+            if self.enable_kb:
+                # Get KB context and past trades
+                kb_context = self.get_kb_context(date)
+                past_patterns = self.kb_reader.get_past_patterns([symbol], limit=10)
+
+                # Build portfolio state for 5-question check
+                portfolio_state = {
+                    'cash': self.portfolio.cash,
+                    'holdings': dict(self.portfolio.holdings)
+                }
+
+                # Create trade plan
+                plan = self.trade_planner.create_trade_plan(
+                    symbol=symbol,
+                    action=decision_type,
+                    quantity=quantity,
+                    price=price,
+                    date=date,
+                    portfolio_state=portfolio_state,
+                    kb_context=kb_context,
+                    past_trades=past_patterns
+                )
+
+                # ===== Phase 2: READ BEFORE DECIDE (Validate) =====
+                is_valid, reason = self.trade_planner.validate_trade_plan(symbol)
+
+                if not is_valid:
+                    logger.warning(f"[{date}] {symbol} {decision_type} BLOCKED: {reason}")
+                    # Record as error (3-strike tracking)
+                    self.trade_planner.record_execution_error(
+                        symbol=symbol,
+                        error_type="validation_blocked",
+                        error_message=reason,
+                        date=date
+                    )
+                    continue
+
+                # ===== Phase 3: EXECUTE =====
+                self.trade_planner.mark_executing(symbol)
+
+            # Execute the trade
             if decision_type == "sell":
                 result = self.portfolio.sell(symbol, quantity, price, date)
-                if result["success"]:
+                success = result["success"]
+                if success:
                     logger.info(f"[{date}] SELL {symbol}: {quantity:.4f} @ ${price:.2f}")
                 else:
-                    logger.debug(f"[{date}] Sell {symbol} failed: {result.get('error')}")
+                    error_msg = result.get('error', 'Unknown error')
+                    logger.debug(f"[{date}] Sell {symbol} failed: {error_msg}")
+                    # Log error with attempts (never repeat failures)
+                    if self.enable_kb:
+                        self.trade_planner.record_execution_error(
+                            symbol=symbol,
+                            error_type="sell_failed",
+                            error_message=error_msg,
+                            date=date
+                        )
 
             elif decision_type == "buy":
                 result = self.portfolio.buy(symbol, quantity, price, date)
-                if result["success"]:
+                success = result["success"]
+                if success:
                     logger.info(f"[{date}] BUY {symbol}: {quantity:.4f} @ ${price:.2f}")
                 else:
-                    logger.debug(f"[{date}] Buy {symbol} failed: {result.get('error')}")
+                    error_msg = result.get('error', 'Unknown error')
+                    logger.debug(f"[{date}] Buy {symbol} failed: {error_msg}")
+                    # Log error with attempts (never repeat failures)
+                    if self.enable_kb:
+                        self.trade_planner.record_execution_error(
+                            symbol=symbol,
+                            error_type="buy_failed",
+                            error_message=error_msg,
+                            date=date
+                        )
+
+            # ===== Phase 4: UPDATE AFTER ACT =====
+            if self.enable_kb:
+                self.trade_planner.complete_trade(
+                    symbol=symbol,
+                    success=success,
+                    outcome_price=price if success else None
+                )
+
+                # 2-Action Rule: Update KB after every 2 trades
+                self.trade_action_count += 1
+                if self.trade_action_count % 2 == 0:
+                    logger.debug(f"[{date}] 2-Action Rule: KB update triggered after {self.trade_action_count} trades")
+
+    def get_historical_returns(self, date: str) -> Dict[str, List[float]]:
+        """
+        Get historical daily returns for each symbol up to the given date.
+        Used for statistical analysis (KS/AD tests).
+        """
+        returns = {}
+
+        for symbol in self.symbols:
+            if symbol not in self.historical_data:
+                continue
+
+            df = self.historical_data[symbol]
+            mask = df.index < date  # Only data before this date
+            prices = df.loc[mask, 'close_price'].tolist()
+
+            # Calculate daily returns
+            if len(prices) >= 2:
+                daily_returns = [
+                    (prices[i] - prices[i-1]) / prices[i-1]
+                    for i in range(1, len(prices))
+                    if prices[i-1] > 0
+                ]
+                returns[symbol] = daily_returns
+
+        return returns
 
     def analyze_and_write_kb(self, date: str, decisions: List[dict], stock_data: Dict[str, dict]):
         """
         Analyze decisions and write to Knowledge Base.
         Called at end of each trading day.
+
+        Uses statistical analysis (KS/AD tests) for quadrant classification:
+        - Q1/Q3 (correct decisions) -> saved as "learnings"
+        - Q2/Q4 (incorrect decisions) -> saved as "errors"
         """
         if not self.enable_kb or not decisions:
             return
@@ -406,14 +534,18 @@ class BacktestEngine:
         # Get past patterns for pattern matching
         past_patterns = self.kb_reader.get_past_patterns(self.symbols, limit=20)
 
-        # Analyze all decisions
+        # Get historical returns for statistical analysis
+        historical_returns = self.get_historical_returns(date)
+
+        # Analyze all decisions WITH statistical quadrant analysis
         try:
-            analyses = analyze_day_decisions(
+            analyses = analyze_day_with_statistics(
                 decisions=decisions,
                 stock_data=stock_data,
                 next_day_prices=next_day_prices,
                 analyzer=self.decision_analyzer,
-                market_return=0.0,  # Could calculate market average
+                historical_returns=historical_returns,
+                market_return=0.0,
                 past_patterns=past_patterns
             )
 
@@ -433,7 +565,14 @@ class BacktestEngine:
                     cash=self.portfolio.cash
                 )
 
-                logger.debug(f"[{date}] KB entry written with {len(analyses)} decision analyses")
+                # Log quadrant summary
+                q_counts = {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
+                for a in analyses:
+                    if a.quadrant:
+                        q_key = a.quadrant.split("_")[0]
+                        q_counts[q_key] = q_counts.get(q_key, 0) + 1
+
+                logger.debug(f"[{date}] KB: {len(analyses)} decisions | Q1:{q_counts['Q1']} Q2:{q_counts['Q2']} Q3:{q_counts['Q3']} Q4:{q_counts['Q4']}")
 
         except Exception as e:
             logger.debug(f"[{date}] Error writing KB entry: {e}")
@@ -485,9 +624,9 @@ class BacktestEngine:
             # Store decisions for KB
             self.daily_decisions[date] = decisions
 
-            # Execute decisions
+            # Execute decisions (with trade planner for each action)
             if decisions:
-                self.execute_decisions(date, decisions, prices)
+                self.execute_decisions(date, decisions, prices, stock_data)
 
             # Record daily snapshot
             self.portfolio.record_daily_snapshot(date, prices)
@@ -552,6 +691,7 @@ async def run_backtest(
     min_sell_amount: float = 1.0,
     max_sell_amount: float = 10.0,
     enable_kb: bool = True,
+    clean_kb: bool = False,
 ) -> dict:
     """
     Convenience function to run a backtest.
@@ -577,6 +717,7 @@ async def run_backtest(
         min_sell_amount=min_sell_amount,
         max_sell_amount=max_sell_amount,
         enable_kb=enable_kb,
+        clean_kb=clean_kb,
     )
 
     return engine.run()

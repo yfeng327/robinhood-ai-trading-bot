@@ -1,6 +1,7 @@
 import re
 import json
 from config import AI_PROVIDER
+from src.utils.text_sanitizer import sanitize_llm_output
 
 # Initialize the appropriate AI client based on provider
 if AI_PROVIDER == "gemini":
@@ -55,6 +56,9 @@ def parse_ai_response(ai_response):
         else:  # openai
             ai_content = ai_response.choices[0].message.content.strip()
 
+        # Sanitize LLM output - remove emojis for locale compatibility
+        ai_content = sanitize_llm_output(ai_content)
+
         # Strip markdown code blocks if present
         ai_content = re.sub(r'```json|```', '', ai_content)
         decisions = json.loads(ai_content)
@@ -67,8 +71,10 @@ def parse_ai_response(ai_response):
 def get_raw_response_content(ai_response):
     """Get raw text content from AI response for logging."""
     if AI_PROVIDER == "gemini":
-        return ai_response.text.strip()
+        raw = ai_response.text.strip()
     elif AI_PROVIDER == "anthropic":
-        return ai_response.content[0].text.strip()
+        raw = ai_response.content[0].text.strip()
     else:  # openai
-        return ai_response.choices[0].message.content.strip()
+        raw = ai_response.choices[0].message.content.strip()
+    # Sanitize for safe logging/error messages
+    return sanitize_llm_output(raw)

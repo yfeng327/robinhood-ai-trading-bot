@@ -1,9 +1,15 @@
 """
 Decision Analyzer - evaluates trading decisions for luck vs skill.
+
+Includes statistical analysis using KS/AD tests for quadrant classification:
+- Q1 ([+][+]): Decision RIGHT + Luck FAVORABLE
+- Q2 ([-][+]): Decision WRONG + Luck FAVORABLE
+- Q3 ([+][-]): Decision RIGHT + Luck UNFAVORABLE
+- Q4 ([-][-]): Decision WRONG + Luck UNFAVORABLE
 """
 
 from typing import Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -35,6 +41,19 @@ class DecisionAnalysis:
     what_went_right: str
     what_went_wrong: str
     lesson_learned: str
+
+    # Statistical quadrant analysis (added via enhance_with_statistics)
+    quadrant: Optional[str] = None                # Q1, Q2, Q3, Q4
+    quadrant_label: Optional[str] = None          # Human-readable quadrant
+    statistical_skill_score: Optional[float] = None   # KS-based skill
+    statistical_luck_pct: Optional[float] = None      # AD-based luck percentage
+    ks_statistic: Optional[float] = None          # Kolmogorov-Smirnov stat
+    ks_p_value: Optional[float] = None            # KS p-value
+    ad_statistic: Optional[float] = None          # Anderson-Darling stat
+    expected_return: Optional[float] = None       # What was expected
+    actual_return: Optional[float] = None         # What happened
+    return_z_score: Optional[float] = None        # How many std devs from mean
+    quadrant_interpretation: Optional[str] = None # Detailed interpretation
 
 
 class DecisionAnalyzer:
@@ -439,3 +458,163 @@ def analyze_day_decisions(
         analyses.append(analysis)
 
     return analyses
+
+
+def enhance_with_statistics(
+    analysis: DecisionAnalysis,
+    historical_returns: List[float],
+    expected_return: float = None
+) -> DecisionAnalysis:
+    """
+    Enhance a DecisionAnalysis with statistical quadrant classification.
+
+    Uses Kolmogorov-Smirnov and Anderson-Darling tests to statistically
+    separate luck from skill.
+
+    Args:
+        analysis: Existing DecisionAnalysis to enhance
+        historical_returns: List of historical daily returns for baseline
+        expected_return: Expected return for this trade (optional)
+
+    Returns:
+        Enhanced DecisionAnalysis with quadrant fields populated
+    """
+    from .luck_statistics import LuckStatisticsAnalyzer, Quadrant
+
+    # Create statistical analyzer with historical data
+    stat_analyzer = LuckStatisticsAnalyzer(historical_returns)
+
+    # Calculate actual return
+    if analysis.price > 0 and analysis.profit_loss is not None:
+        actual_return = analysis.profit_loss / (analysis.price * analysis.quantity) if analysis.quantity > 0 else 0
+    else:
+        actual_return = 0
+
+    # Use expected return if provided, otherwise estimate from indicators
+    if expected_return is None:
+        # Estimate expected return from indicator alignment
+        # Higher alignment suggests higher expected return
+        alignment_factor = analysis.indicator_alignment / 30  # 0-1
+        expected_return = 0.01 * alignment_factor if analysis.action == 'buy' else -0.01 * alignment_factor
+
+    # Determine if indicators were aligned
+    indicators_aligned = analysis.indicator_alignment >= 20
+
+    # Determine if position sized correctly
+    position_sized_correctly = analysis.position_sizing >= 15
+
+    # Calculate historical success rate from pattern match
+    historical_success_rate = analysis.pattern_match / 25  # 0-1
+
+    # Run statistical analysis
+    stat_result = stat_analyzer.analyze_decision(
+        actual_return=actual_return,
+        expected_return=expected_return,
+        indicators_aligned=indicators_aligned,
+        position_sized_correctly=position_sized_correctly,
+        historical_success_rate=historical_success_rate
+    )
+
+    # Populate the statistical fields
+    analysis.quadrant = stat_result.quadrant.name
+    analysis.quadrant_label = stat_result.quadrant.value
+    analysis.statistical_skill_score = stat_result.skill_score
+    analysis.statistical_luck_pct = stat_result.luck_percentage
+    analysis.ks_statistic = stat_result.ks_statistic
+    analysis.ks_p_value = stat_result.ks_p_value
+    analysis.ad_statistic = stat_result.ad_statistic
+    analysis.expected_return = stat_result.expected_return
+    analysis.actual_return = stat_result.actual_return
+    analysis.return_z_score = stat_result.return_deviation
+    analysis.quadrant_interpretation = stat_result.interpretation
+
+    return analysis
+
+
+def analyze_day_with_statistics(
+    decisions: List[Dict],
+    stock_data: Dict[str, Dict],
+    next_day_prices: Dict[str, float],
+    analyzer: DecisionAnalyzer,
+    historical_returns: Dict[str, List[float]],
+    market_return: float = 0.0,
+    past_patterns: List[Dict] = None
+) -> List[DecisionAnalysis]:
+    """
+    Analyze all decisions for a trading day WITH statistical quadrant analysis.
+
+    This is the enhanced version of analyze_day_decisions that includes
+    KS/AD statistical tests for luck vs skill separation.
+
+    Args:
+        decisions: List of AI decisions
+        stock_data: Stock data at time of decisions
+        next_day_prices: Prices on next day for outcome evaluation
+        analyzer: DecisionAnalyzer instance
+        historical_returns: Dict of symbol -> list of historical returns
+        market_return: Market average return for comparison
+        past_patterns: Historical patterns for matching
+
+    Returns:
+        List of DecisionAnalysis objects with statistical fields populated
+    """
+    # First get basic analyses
+    analyses = analyze_day_decisions(
+        decisions=decisions,
+        stock_data=stock_data,
+        next_day_prices=next_day_prices,
+        analyzer=analyzer,
+        market_return=market_return,
+        past_patterns=past_patterns
+    )
+
+    # Enhance each with statistical analysis
+    for analysis in analyses:
+        symbol = analysis.symbol
+        symbol_returns = historical_returns.get(symbol, [])
+
+        if len(symbol_returns) >= 10:  # Need minimum data for statistics
+            enhance_with_statistics(analysis, symbol_returns)
+
+    return analyses
+
+
+def format_quadrant_recap(analysis: DecisionAnalysis) -> str:
+    """
+    Format a single decision's quadrant analysis for the recap.
+
+    This is the key output for absorption - clearly shows the quadrant
+    and interpretation for each decision.
+    """
+    if analysis.quadrant is None:
+        return f"**{analysis.symbol}** ({analysis.action}): No statistical analysis available"
+
+    # Build indicator based on quadrant
+    quadrant_indicators = {
+        "Q1_SKILL_LUCK": "[+][+]",
+        "Q2_NOSKILL_LUCK": "[-][+]",
+        "Q3_SKILL_NOLUCK": "[+][-]",
+        "Q4_NOSKILL_NOLUCK": "[-][-]"
+    }
+    indicator = quadrant_indicators.get(analysis.quadrant, "[?][?]")
+
+    lines = [
+        f"### {analysis.symbol} ({analysis.action.upper()}) - {indicator} {analysis.quadrant}",
+        "",
+        f"**Quadrant:** {analysis.quadrant_label}",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Decision Skill | {analysis.statistical_skill_score:.0f}/100 |",
+        f"| Luck Percentage | {analysis.statistical_luck_pct:.0f}% |",
+        f"| Expected Return | {analysis.expected_return*100:+.2f}% |",
+        f"| Actual Return | {analysis.actual_return*100:+.2f}% |",
+        f"| Return Z-Score | {analysis.return_z_score:+.2f}σ |",
+        f"| KS Statistic | {analysis.ks_statistic:.4f} |",
+        f"| AD Statistic | {analysis.ad_statistic:.4f} |",
+        "",
+        f"**Interpretation:** {analysis.quadrant_interpretation}",
+        ""
+    ]
+
+    return "\n".join(lines)

@@ -1,127 +1,119 @@
-# Findings & Decisions: Trading Knowledge Base (KB) System
+# Findings: Demo/Live Trading Enhancements
 
-## Requirements
-- Create persistent KB system mirroring plan-with-files structure
-- Write daily KB entries summarizing trading and performance
-- Include recap of AI decisions: what went right/wrong
-- Analyze luck vs skill for each decision
-- Enable RAG-style retrieval of past memories
-- Consult previous errors and learnings in subsequent days
+## Current Workflow (main.py trading_bot())
 
-## KB Design: Luck vs Skill Analysis
-
-### What is Skill?
-- **Decision aligned with indicators**: RSI, VWAP, moving averages all pointed same direction
-- **Correct timing**: Entry/exit at optimal points based on available data
-- **Risk management**: Proper position sizing, not over-concentrating
-- **Pattern recognition**: Similar past situations were handled correctly
-
-### What is Luck?
-- **Unexpected price movements**: Earnings surprises, news events, market-wide swings
-- **External factors**: Fed announcements, geopolitical events
-- **Indicator disagreement**: Indicators pointed different directions, but trade worked anyway
-- **Random walk benefit**: Price moved favorably despite no clear signal
-
-### Scoring System
+### Data Flow:
 ```
-Decision Score = (Skill Score * 0.6) + (Outcome Score * 0.4)
-
-Skill Score (0-100):
-- Indicator alignment: +30 (if RSI, MA, VWAP agree)
-- Proper position size: +20 (within min/max amounts)
-- Risk/reward ratio: +25 (based on expected vs actual)
-- Historical pattern match: +25 (similar past decisions worked)
-
-Outcome Score (0-100):
-- Profitable trade: +50
-- Beat market average: +25
-- Minimal drawdown: +25
+1. get_account_info() -> buying_power
+2. get_portfolio_stocks() -> portfolio_stocks
+3. For each stock:
+   a. get_historical_data(symbol, "5minute", "day")  -> intraday 5-min bars
+   b. get_historical_data(symbol, "day", "year")      -> daily bars
+   c. get_ratings(symbol)                              -> analyst ratings
+   d. enrich_with_rsi(stock_data, historical_data_day)
+   e. enrich_with_vwap(stock_data, historical_data_day)
+   f. enrich_with_moving_averages(stock_data, historical_data_year)
+   g. enrich_with_analyst_ratings(stock_data, ratings_data)
+   h. enrich_with_pdt_restrictions(stock_data, symbol)
+4. kb_tracker.evaluate_pending_decisions()  -> writes KB from previous cycle
+5. make_ai_decisions(account_info, portfolio, watchlist)
+   - Builds prompt with: Context + KB Context + Constraints + Stock Data JSON
+   - Stock Data JSON: {symbol: {current_price, my_quantity, avg_buy_price, rsi, vwap, 50d_ma, 200d_ma, analyst_summary, analyst_ratings, pdt_flags}}
+   - MISSING: No intraday price trajectory, no volume data, no volume comparison
+6. Execute trades
+7. kb_tracker.record_decisions()
 ```
 
-## KB Directory Structure
-```
-kb/
-├── master_index.md           # Aggregated learnings, patterns, rules
-├── lessons_learned.md        # Accumulated wisdom from all days
-├── sessions/
-│   └── YYYY-MM-DD/
-│       ├── daily_summary.md  # Performance + decisions for that day
-│       ├── decisions.json    # Structured decision data
-│       └── analysis.md       # Luck vs skill breakdown
-└── patterns/
-    ├── bullish_patterns.md   # Successful buy patterns
-    ├── bearish_patterns.md   # Successful sell patterns
-    └── mistakes.md           # Common errors to avoid
-```
-
-## Daily Entry Template Structure
-
-### daily_summary.md
-```markdown
-# Trading Day Summary: YYYY-MM-DD
-
-## Performance Metrics
-- Starting Value: $X
-- Ending Value: $Y
-- Day Return: +/-Z%
-- Trades Executed: N
-
-## Decisions Made
-| Symbol | Action | Qty | Price | Outcome | Skill Score | Luck Factor |
-|--------|--------|-----|-------|---------|-------------|-------------|
-
-## What Went Right
-- [List of correct decisions with reasoning]
-
-## What Went Wrong
-- [List of incorrect decisions with analysis]
-
-## Luck vs Skill Analysis
-- Total Skill Score: X/100
-- Luck Factor: Y%
-- Key Learning: [Main takeaway]
-
-## Lessons for Tomorrow
-- [Actionable insights to carry forward]
+### What LLM Currently SEES in Stock Data:
+```json
+{
+  "VOO": {
+    "current_price": 635.54,
+    "my_quantity": 239.0,
+    "my_average_buy_price": 520.0,
+    "rsi": 45.2,
+    "vwap": 633.10,
+    "50_day_mavg_price": 610.0,
+    "200_day_mavg_price": 580.0,
+    "analyst_summary": {...},
+    "analyst_ratings": [...]
+  }
+}
 ```
 
-## RAG Integration Approach
+### What LLM SHOULD Also See:
+```
+Today's Intraday Data (VOO):
+Time    | Price  | Vol   | VolRatio
+09:30   | 634.20 | 120K  | 1.2x
+10:00   | 634.80 | 95K   | 0.9x
+10:30   | 635.10 | 88K   | 0.8x
+...     | ...    | ...   | ...
+```
 
-### Before Each Trading Day
-1. Read `master_index.md` for accumulated rules
-2. Read last 5 `daily_summary.md` files for recent context
-3. Search `patterns/` for similar market conditions
-4. Search `mistakes.md` for errors to avoid
-5. Build context string for AI prompt
+## Robinhood API Data Structure
 
-### After Each Trading Day
-1. Evaluate each decision (skill score, outcome)
-2. Write `daily_summary.md`
-3. Update `master_index.md` with new patterns
-4. Update `lessons_learned.md` if significant learning
-5. Update `mistakes.md` if error occurred
+### 5-minute historical bar (from get_stock_historicals):
+```python
+{
+    "begins_at": "2026-01-29T14:30:00Z",
+    "close_price": "635.54",
+    "high_price": "636.10",
+    "low_price": "634.90",
+    "open_price": "635.20",
+    "volume": 12345,
+    "session": "reg",         # regular trading hours
+    "interpolated": False
+}
+```
 
-## Technical Decisions
-| Decision | Rationale |
-|----------|-----------|
-| Markdown files for KB | Human-readable, version-controllable, easy to inspect |
-| JSON for structured data | Machine-parseable for analytics |
-| Session-based directories | Easy to find specific day's data |
-| Master index pattern | Quick RAG retrieval without reading all files |
-| 60/40 skill/outcome weighting | Rewards good process even if outcome bad |
+### Available intervals: "5minute", "10minute", "hour", "day", "week"
+### Available spans: "day", "week", "month", "3month", "year", "5year"
 
-## Files to Create
-1. `src/kb/__init__.py` - Module exports
-2. `src/kb/writer.py` - Write daily summaries
-3. `src/kb/reader.py` - RAG retrieval
-4. `src/kb/analyzer.py` - Luck vs skill scoring
-5. `src/kb/templates.py` - MD templates
+## KB Timestamp Issues
 
-## Integration Points in engine.py
-- `run()` method: Call KB reader before trading day loop
-- `make_ai_decisions()`: Include KB context in prompt
-- `execute_decisions()`: Track decisions for scoring
-- After daily loop: Call KB writer to save summary
+### Current format in KB entries:
+- `[2026-01-29] NVDA: BUY worked (skill=58...)`
+- `[2026-01-29] Avg Skill: 65, Luck: 30%`
+
+### Problem:
+In demo/live mode with 600s cycles, there are ~39 cycles per trading day (9:30-16:00).
+Each cycle may produce entries, but they all show the same date `[2026-01-29]`.
+No way to distinguish decisions made at 9:30 vs 15:30.
+
+### Fix:
+Use `[2026-01-29 14:30]` format to include the time of the decision.
+
+## "Recent Lessons" Problem
+
+### Current code (writer.py _update_master_index, line 942):
+```python
+new_lesson = f"\n- [{date}] Avg Skill: {avg_skill:.0f}, Luck: {avg_luck:.0%}"
+```
+
+### Problem:
+This is NOT a lesson. It's just statistics. A lesson should be actionable:
+- "BUY NVDA at RSI<30 worked well (Q1: skill+luck)"
+- "SELL TQQQ on high volume days reduces losses"
+- "Holding IREN through earnings was a mistake (Q4)"
+
+### Fix:
+Generate actual lesson text from the best/worst decisions of the day:
+- Q1 (skill+luck): Extract what made it a good decision -> positive lesson
+- Q4 (no skill+no luck): Extract what went wrong -> avoidance lesson
+- Use the `lesson_learned` field from DecisionAnalysis
+
+## Volume Analysis Approach
+
+### What to compute:
+1. **Current period volume**: Sum of volume in last 30 minutes
+2. **Average period volume**: Average 30-min volume from historical_data_day
+3. **Volume ratio**: current / average (>1.0 = higher than usual)
+
+### Why it matters:
+- High volume + price move = stronger signal (institutional activity)
+- Low volume + price move = weaker signal (noise)
+- Unusual volume spikes can indicate breakouts or reversals
 
 ---
-*Update this file after every 2 view/browser/search operations*
+*Updated: 2026-01-29*
