@@ -1,7 +1,10 @@
 import re
 import json
+import logging
 from config import AI_PROVIDER
 from src.utils.text_sanitizer import sanitize_llm_output
+
+logger = logging.getLogger(__name__)
 
 # Initialize the appropriate AI client based on provider
 if AI_PROVIDER == "gemini":
@@ -25,25 +28,31 @@ else:
 
 def make_ai_request(prompt):
     """Make AI request to the configured provider."""
+    logger.info(f"[LLM REQUEST] Provider: {AI_PROVIDER}, Model: {model_name}, Prompt length: {len(prompt)} chars")
+    logger.debug(f"[LLM REQUEST] Full prompt:\n{prompt}")
+
     if AI_PROVIDER == "gemini":
         ai_resp = client.models.generate_content(
             model=model_name,
             contents=prompt
         )
-        return ai_resp
     elif AI_PROVIDER == "anthropic":
         ai_resp = client.messages.create(
             model=model_name,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
         )
-        return ai_resp
     else:  # openai
         ai_resp = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}]
         )
-        return ai_resp
+
+    raw_response = get_raw_response_content(ai_resp)
+    logger.info(f"[LLM RESPONSE] Length: {len(raw_response)} chars")
+    logger.debug(f"[LLM RESPONSE] Full response:\n{raw_response}")
+
+    return ai_resp
 
 
 def parse_ai_response(ai_response):

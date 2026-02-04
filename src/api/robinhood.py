@@ -56,13 +56,11 @@ async def login_to_robinhood():
 def rh_run_with_retries(func, *args, max_retries=3, delay=60, **kwargs):
     for attempt in range(max_retries):
         result = func(*args, **kwargs)
-        msg = f"Function: {func.__name__}, Parameters: {args}, Attempt: {attempt + 1}/{max_retries}, Result: {result}"
-        msg = msg[:1000] + '...' if len(msg) > 1000 else msg
-        logger.debug(msg)
         if result is not None:
             return result
-        logger.debug(f"Function: {func.__name__}, Parameters: {args}, Retrying in {delay} seconds...")
-        time.sleep(delay)
+        if attempt < max_retries - 1:  # Don't log on last attempt
+            logger.warning(f"Robinhood API call {func.__name__} returned None, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
     return None
 
 
@@ -362,6 +360,14 @@ def get_ratings(symbol):
     resp = rh_run_with_retries(rh.stocks.get_ratings, symbol)
     if resp is None:
         raise Exception(f"Error getting ratings for {symbol}: No response")
+    return resp
+
+
+# Get current quote for a stock by symbol
+def get_quote(symbol):
+    resp = rh_run_with_retries(rh.stocks.get_stock_quote_by_symbol, symbol)
+    if resp is None:
+        raise Exception(f"Error getting quote for {symbol}: No response")
     return resp
 
 

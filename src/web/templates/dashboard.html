@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <span class="logo">🤖</span>
+                <h1>Trading Bot Dashboard</h1>
+            </div>
+            <div class="header-right">
+                <span class="status-indicator" id="status-indicator">
+                    <span class="status-dot"></span>
+                    <span id="status-text">Connecting...</span>
+                </span>
+                <span class="time" id="current-time"></span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Top Row -->
+            <div class="row">
+                <!-- Live Trading Panel -->
+                <div class="card live-trading">
+                    <div class="card-header">
+                        <h2>📈 Live Trading</h2>
+                        <span class="badge" id="cycle-badge">Last: --</span>
+                    </div>
+                    <div class="card-content">
+                        <div class="stats-row">
+                            <div class="stat">
+                                <span class="stat-value" id="decisions-count">0</span>
+                                <span class="stat-label">Decisions Today</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-value" id="buffered-count">0</span>
+                                <span class="stat-label">Awaiting Review</span>
+                            </div>
+                        </div>
+                        <div class="trades-list" id="trades-list">
+                            <div class="empty-state">No trades yet today</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Lessons Panel -->
+                <div class="card lessons">
+                    <div class="card-header">
+                        <h2>📚 Lessons Learned</h2>
+                        <span class="badge" id="lessons-badge">0 total</span>
+                    </div>
+                    <div class="card-content">
+                        <div class="tabs">
+                            <button class="tab active" data-tab="works">✅ What Works</button>
+                            <button class="tab" data-tab="doesnt">⛔ What Doesn't</button>
+                        </div>
+                        <div class="tab-content active" id="tab-works">
+                            <ul class="lessons-list" id="lessons-works">
+                                <li class="empty-state">No lessons yet</li>
+                            </ul>
+                        </div>
+                        <div class="tab-content" id="tab-doesnt">
+                            <ul class="lessons-list" id="lessons-doesnt">
+                                <li class="empty-state">No lessons yet</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- EOD Review Panel -->
+            <div class="card eod-review">
+                <div class="card-header">
+                    <h2>🔍 End-of-Day Review</h2>
+                    <button class="btn btn-primary" id="eod-button" onclick="triggerEODReview()">
+                        Run Review Now
+                    </button>
+                </div>
+                <div class="card-content">
+                    <div class="eod-status" id="eod-status">
+                        <div class="eod-stat">
+                            <span class="label">Last Run:</span>
+                            <span class="value" id="eod-last-run">Never</span>
+                        </div>
+                        <div class="eod-stat">
+                            <span class="label">Decisions Analyzed:</span>
+                            <span class="value" id="eod-decisions">--</span>
+                        </div>
+                        <div class="eod-stat">
+                            <span class="label">Lessons Written:</span>
+                            <span class="value" id="eod-lessons">--</span>
+                        </div>
+                        <div class="eod-stat">
+                            <span class="label">Duplicates Removed:</span>
+                            <span class="value" id="eod-dupes">--</span>
+                        </div>
+                    </div>
+                    <div class="eod-result hidden" id="eod-result"></div>
+                </div>
+            </div>
+
+            <!-- Event Log -->
+            <div class="card event-log">
+                <div class="card-header">
+                    <h2>📋 Event Log</h2>
+                    <button class="btn btn-secondary" onclick="clearLog()">Clear</button>
+                </div>
+                <div class="card-content">
+                    <div class="log-list" id="log-list">
+                        <div class="log-entry info">Waiting for events...</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // State
+        let eventSource = null;
+        let tradeCount = 0;
+        let lastEODResults = null;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            updateTime();
+            setInterval(updateTime, 1000);
+            
+            fetchInitialData();
+            connectSSE();
+            setupTabs();
+        });
+
+        // Time display
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('current-time').textContent = 
+                now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // SSE Connection
+        function connectSSE() {
+            eventSource = new EventSource('/api/stream');
+            
+            eventSource.onopen = () => {
+                setStatus('live', 'Live');
+            };
+            
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleEvent(data);
+                } catch (e) {
+                    console.error('SSE parse error:', e);
+                }
+            };
+            
+            eventSource.onerror = () => {
+                setStatus('offline', 'Disconnected');
+                setTimeout(connectSSE, 5000);
+            };
+        }
+
+        // Handle incoming events
+        function handleEvent(event) {
+            addLogEntry(event);
+            
+            switch (event.type) {
+                case 'trade':
+                    addTrade(event.data);
+                    break;
+                case 'cycle_complete':
+                    updateCycleStats(event.data);
+                    break;
+                case 'eod_review':
+                    updateEODResults(event.data);
+                    break;
+            }
+        }
+
+        // Fetch initial data
+        async function fetchInitialData() {
+            try {
+                // Status
+                const statusRes = await fetch('/api/status');
+                const status = await statusRes.json();
+                document.getElementById('buffered-count').textContent = status.buffered_decisions || 0;
+                if (status.running) setStatus('live', 'Live');
+                
+                // Decisions
+                const decisionsRes = await fetch('/api/decisions');
+                const decisions = await decisionsRes.json();
+                document.getElementById('decisions-count').textContent = decisions.count || 0;
+                
+                // Lessons
+                const lessonsRes = await fetch('/api/lessons');
+                const lessons = await lessonsRes.json();
+                updateLessons(lessons);
+                
+                // History
+                const historyRes = await fetch('/api/history');
+                const history = await historyRes.json();
+                history.events.forEach(e => addLogEntry(e, true));
+                
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        // Update lessons display
+        function updateLessons(lessons) {
+            const worksList = document.getElementById('lessons-works');
+            const doesntList = document.getElementById('lessons-doesnt');
+            
+            worksList.innerHTML = lessons.what_works.length ? 
+                lessons.what_works.map(l => `<li>${escapeHtml(l)}</li>`).join('') :
+                '<li class="empty-state">No lessons yet</li>';
+            
+            doesntList.innerHTML = lessons.what_doesnt.length ?
+                lessons.what_doesnt.map(l => `<li>${escapeHtml(l)}</li>`).join('') :
+                '<li class="empty-state">No lessons yet</li>';
+            
+            document.getElementById('lessons-badge').textContent = `${lessons.total} total`;
+        }
+
+        // Add trade to list
+        function addTrade(trade) {
+            const list = document.getElementById('trades-list');
+            const empty = list.querySelector('.empty-state');
+            if (empty) empty.remove();
+            
+            const entry = document.createElement('div');
+            entry.className = `trade-entry ${trade.result}`;
+            entry.innerHTML = `
+                <span class="trade-action ${trade.action}">${trade.action.toUpperCase()}</span>
+                <span class="trade-symbol">${trade.symbol}</span>
+                <span class="trade-qty">x${trade.quantity}</span>
+                <span class="trade-result">${trade.result === 'success' ? '✓' : '✗'}</span>
+            `;
+            list.insertBefore(entry, list.firstChild);
+            
+            tradeCount++;
+            document.getElementById('decisions-count').textContent = tradeCount;
+        }
+
+        // Update cycle stats
+        function updateCycleStats(data) {
+            const now = new Date();
+            document.getElementById('cycle-badge').textContent = 
+                `Last: ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+            
+            // Add trades from cycle
+            [...(data.bought || []), ...(data.sold || [])].forEach(t => {
+                addTrade({
+                    symbol: t.split(' ')[0] || t,
+                    action: data.bought?.includes(t) ? 'buy' : 'sell',
+                    quantity: 1,
+                    result: 'success'
+                });
+            });
+        }
+
+        // Trigger EOD review
+        async function triggerEODReview() {
+            const btn = document.getElementById('eod-button');
+            btn.disabled = true;
+            btn.textContent = 'Running...';
+            
+            try {
+                const res = await fetch('/api/eod-review', { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.success) {
+                    updateEODResults(data.results);
+                    showNotification('EOD Review completed successfully!', 'success');
+                } else {
+                    showNotification(`Error: ${data.error}`, 'error');
+                }
+            } catch (e) {
+                showNotification(`Error: ${e.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Run Review Now';
+            }
+        }
+
+        // Update EOD results
+        function updateEODResults(results) {
+            lastEODResults = results;
+            
+            const now = new Date();
+            document.getElementById('eod-last-run').textContent = 
+                now.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            document.getElementById('eod-decisions').textContent = results.successful || results.decisions || 0;
+            document.getElementById('eod-lessons').textContent = results.lessons_written || 0;
+            document.getElementById('eod-dupes').textContent = results.duplicates_removed || 0;
+            
+            // Refresh lessons
+            fetch('/api/lessons')
+                .then(r => r.json())
+                .then(updateLessons);
+        }
+
+        // Add log entry
+        function addLogEntry(event, prepend = false) {
+            const list = document.getElementById('log-list');
+            const waiting = list.querySelector('.log-entry.info');
+            if (waiting && waiting.textContent.includes('Waiting')) waiting.remove();
+            
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${event.type || 'info'}`;
+            
+            const time = new Date(event.timestamp).toLocaleTimeString('en-US', 
+                { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            
+            entry.innerHTML = `
+                <span class="log-time">${time}</span>
+                <span class="log-type">${event.type || 'info'}</span>
+                <span class="log-msg">${formatEventData(event)}</span>
+            `;
+            
+            if (prepend) {
+                list.appendChild(entry);
+            } else {
+                list.insertBefore(entry, list.firstChild);
+            }
+            
+            // Limit log entries
+            while (list.children.length > 50) {
+                list.removeChild(list.lastChild);
+            }
+        }
+
+        // Format event for log
+        function formatEventData(event) {
+            const d = event.data || {};
+            switch (event.type) {
+                case 'trade':
+                    return `${d.action?.toUpperCase()} ${d.symbol} x${d.quantity} → ${d.result}`;
+                case 'cycle_complete':
+                    return `Cycle: ${d.decisions} decisions, ${(d.bought||[]).length} buys, ${(d.sold||[]).length} sells`;
+                case 'eod_review':
+                    return `EOD: ${d.lessons_written} lessons, ${d.duplicates_removed} dupes removed`;
+                default:
+                    return JSON.stringify(d).substring(0, 100);
+            }
+        }
+
+        // Status indicator
+        function setStatus(status, text) {
+            const indicator = document.getElementById('status-indicator');
+            const textEl = document.getElementById('status-text');
+            
+            indicator.className = `status-indicator ${status}`;
+            textEl.textContent = text;
+        }
+
+        // Tab switching
+        function setupTabs() {
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    const tabId = tab.dataset.tab;
+                    
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    
+                    tab.classList.add('active');
+                    document.getElementById(`tab-${tabId}`).classList.add('active');
+                });
+            });
+        }
+
+        // Clear log
+        function clearLog() {
+            document.getElementById('log-list').innerHTML = 
+                '<div class="log-entry info">Log cleared</div>';
+        }
+
+        // Notification
+        function showNotification(msg, type) {
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.textContent = msg;
+            document.body.appendChild(notification);
+            
+            setTimeout(() => notification.classList.add('show'), 10);
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => notification.remove(), 300);
+            }, 3000);
+        }
+
+        // Escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>

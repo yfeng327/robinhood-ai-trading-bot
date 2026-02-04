@@ -6,3 +6,4 @@ onepassword~=0.4.1
 pandas~=2.2.3
 pytz~=2024.2
 pyotp~=2.9.0
+flask~=3.0.0

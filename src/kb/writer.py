@@ -814,21 +814,31 @@ The AI should consult this before making decisions.
             }
             indicator = quadrant_indicators.get(a.quadrant, "[?][?]")
 
+            # Safe formatting for potentially None statistical values
+            skill_str = f"{a.statistical_skill_score:.0f}" if a.statistical_skill_score is not None else "N/A"
+            luck_str = f"{a.statistical_luck_pct:.0f}" if a.statistical_luck_pct is not None else "N/A"
+            exp_ret_str = f"{a.expected_return*100:+.2f}" if a.expected_return is not None else "N/A"
+            act_ret_str = f"{a.actual_return*100:+.2f}" if a.actual_return is not None else "N/A"
+            z_score_str = f"{a.return_z_score:+.2f}" if a.return_z_score is not None else "N/A"
+            ks_str = f"{a.ks_statistic:.4f}" if a.ks_statistic is not None else "N/A"
+            ks_p_str = f"{a.ks_p_value:.4f}" if a.ks_p_value is not None else "N/A"
+            ad_str = f"{a.ad_statistic:.4f}" if a.ad_statistic is not None else "N/A"
+
             content += f"""### {a.symbol} ({a.action.upper()}) - {indicator} {a.quadrant}
 
 **Quadrant:** {a.quadrant_label}
 
 | Metric | Value |
 |--------|-------|
-| Decision Skill | {a.statistical_skill_score:.0f}/100 |
-| Luck Percentage | {a.statistical_luck_pct:.0f}% |
-| Expected Return | {a.expected_return*100:+.2f}% |
-| Actual Return | {a.actual_return*100:+.2f}% |
-| Return Z-Score | {a.return_z_score:+.2f}σ |
-| KS Statistic | {a.ks_statistic:.4f} (p={a.ks_p_value:.4f}) |
-| AD Statistic | {a.ad_statistic:.4f} |
+| Decision Skill | {skill_str}/100 |
+| Luck Percentage | {luck_str}% |
+| Expected Return | {exp_ret_str}% |
+| Actual Return | {act_ret_str}% |
+| Return Z-Score | {z_score_str}σ |
+| KS Statistic | {ks_str} (p={ks_p_str}) |
+| AD Statistic | {ad_str} |
 
-**Interpretation:** {a.quadrant_interpretation}
+**Interpretation:** {a.quadrant_interpretation or 'No interpretation available'}
 
 ---
 
@@ -1048,11 +1058,14 @@ The AI should consult this before making decisions.
         # Get dominant quadrant
         q_counts = {}
         for a in analyses:
-            q = getattr(a, 'quadrant', 'N/A')
-            q_counts[q] = q_counts.get(q, 0) + 1
-        dominant_q = max(q_counts, key=q_counts.get) if q_counts else 'N/A'
+            q = getattr(a, 'quadrant', None)
+            if q is not None:  # Only count non-None quadrants
+                q_counts[q] = q_counts.get(q, 0) + 1
+        dominant_q = max(q_counts, key=q_counts.get) if q_counts else None
 
-        new_entry = f"\n| {date} | {avg_skill:.0f} | {avg_luck:.0%} | Dominant: {dominant_q[:2] if dominant_q != 'N/A' else 'N/A'} |"
+        # Safe formatting for dominant quadrant (handles None)
+        dominant_str = dominant_q[:2] if dominant_q else 'N/A'
+        new_entry = f"\n| {date} | {avg_skill:.0f} | {avg_luck:.0%} | Dominant: {dominant_str} |"
         if "| Date | Avg Skill Score | Avg Luck Factor | Key Learning |\n|------|-----------------|-----------------|--------------|" in content:
             content = content.replace(
                 "| Date | Avg Skill Score | Avg Luck Factor | Key Learning |\n|------|-----------------|-----------------|--------------|",

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from config import LOG_LEVEL
 
@@ -36,3 +37,32 @@ def warning(msg):
 # Print error log message
 def error(msg):
     log("ERROR", msg)
+
+
+# ============================================================================
+# Bridge: Route Python's standard logging module through the custom logger
+# ============================================================================
+# Modules like src.api.ai, src.day_trading.bot, src.eod_review.reviewer, and
+# src.kb.lesson_generator use logging.getLogger(__name__). Without a handler
+# configured on the root logger, all their output (including LLM I/O logs)
+# is silently discarded. This handler bridges the two systems.
+
+class _BridgeHandler(logging.Handler):
+    """Routes standard logging records through the custom log() function."""
+    def emit(self, record):
+        level = record.levelname
+        # Map standard logging levels to our custom levels
+        if level == "CRITICAL":
+            level = "ERROR"
+        log(level, record.getMessage())
+
+
+# Map our LOG_LEVEL string to a standard logging level
+_level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+_std_level = _level_map.get(LOG_LEVEL, logging.INFO)
+
+# Configure the root logger so all getLogger(__name__) loggers inherit this
+_bridge = _BridgeHandler()
+_bridge.setLevel(_std_level)
+logging.root.addHandler(_bridge)
+logging.root.setLevel(_std_level)
