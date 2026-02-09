@@ -1,8 +1,8 @@
 """
 KB Reader - reads and retrieves knowledge base entries for RAG.
 
-Includes token-aware retrieval with priority-based truncation.
-Priority order: Ad-hoc Strategies > Never Repeat > KB Rules > History > Mistakes
+Uses LLM synthesis to build context from all KB files.
+Falls back to strategies-only context when LLM is unavailable.
 """
 
 import os
@@ -16,15 +16,9 @@ from .strategies import StrategyReader
 
 logger = logging.getLogger(__name__)
 
-# Token budget per section (chars, assuming ~4 chars/token)
-SECTION_BUDGETS = {
-    'adhoc_strategies': 1200,    # Highest priority
-    'never_repeat': 1200,        # Critical mistakes
-    'trading_rules': 800,        # Learned patterns
-    'symbol_history': 600,       # Recent decisions
-    'recent_summaries': 600,     # Past performance
-    'mistakes': 400,             # Additional errors
-}
+# Budget for ad-hoc strategies section (chars)
+STRATEGIES_BUDGET = 1200
+
 
 
 class KBReader:
@@ -56,16 +50,8 @@ class KBReader:
         """
         Build context string for AI trading decisions.
 
-        Priority order (highest to lowest):
-        1. Ad-hoc Strategies (user-defined, highest priority)
-        2. Never Repeat Rules (critical mistakes)
-        3. Trading Rules (learned patterns)
-        4. Symbol History (recent decisions)
-        5. Recent Summaries (past performance)
-        6. Mistakes Summary (additional errors)
-
-        Uses token-aware retrieval to stay within budget while
-        preserving highest priority content.
+        Uses LLM to synthesize relevant context from all KB files.
+        Falls back to keyword-based extraction if LLM fails.
 
         Args:
             symbols: Stock symbols being considered today
@@ -76,303 +62,181 @@ class KBReader:
         Returns:
             Formatted context string to include in AI prompt
         """
-        sections = []
-        remaining_budget = max_context_chars
-
-        # 1. [HIGHEST] Ad-hoc Strategies - User-defined, always included first
+        # User strategies are always included verbatim (highest priority, structured)
+        strategies_text = ""
         if self.strategy_reader.strategies_exist():
-            strategies = self.strategy_reader.format_for_prompt(
-                max_chars=SECTION_BUDGETS['adhoc_strategies']
+            strategies_text = self.strategy_reader.format_for_prompt(
+                max_chars=STRATEGIES_BUDGET
             )
-            if strategies:
-                sections.append(("USER STRATEGIES", strategies))
-                remaining_budget -= len(strategies) + 50  # 50 for header
 
-        # 2. [CRITICAL] Never Repeat Rules - Must not repeat past mistakes
-        if remaining_budget > 200:
-            never_repeat = self._get_never_repeat_rules()
-            if never_repeat:
-                truncated = never_repeat[:min(len(never_repeat), SECTION_BUDGETS['never_repeat'])]
-                sections.append(("[!] NEVER REPEAT - CRITICAL MISTAKES", truncated))
-                remaining_budget -= len(truncated) + 50
+        # Try LLM-based synthesis
+        try:
+            kb_content = self._gather_kb_content(current_date, max_history_days)
+            if kb_content:
+                llm_budget = max_context_chars - len(strategies_text) - 100
+                synthesized = self._llm_synthesize_context(
+                    kb_content, symbols, current_date, llm_budget
+                )
+                if synthesized:
+                    sections = []
+                    if strategies_text:
+                        sections.append(("USER STRATEGIES", strategies_text))
+                    sections.append(("KB INSIGHTS", synthesized))
+                    context = self._build_context(sections, max_context_chars)
+                    logger.info(f"KB context built via LLM: {len(context)} chars")
+                    return context
+        except Exception as e:
+            logger.warning(f"LLM KB synthesis failed: {e}")
 
-        # 3. Trading rules from master index
-        if remaining_budget > 200 and self.kb_exists():
-            rules = self._get_trading_rules()
-            if rules:
-                truncated = rules[:min(len(rules), SECTION_BUDGETS['trading_rules'])]
-                sections.append(("Trading Rules (from experience)", truncated))
-                remaining_budget -= len(truncated) + 50
+        # Fallback: return just user strategies (no brittle keyword parsing)
+        if strategies_text:
+            return self._build_context([("USER STRATEGIES", strategies_text)], max_context_chars)
+        return ""
 
-        # 4. Past decisions for these symbols
-        if remaining_budget > 200 and self.kb_exists():
-            symbol_history = self._get_symbol_history(symbols, current_date, limit=3)
-            if symbol_history:
-                truncated = symbol_history[:min(len(symbol_history), SECTION_BUDGETS['symbol_history'])]
-                sections.append(("Past Decisions for These Symbols", truncated))
-                remaining_budget -= len(truncated) + 50
+    def _gather_kb_content(self, current_date: str, max_history_days: int) -> Dict[str, str]:
+        """
+        Read all KB files into a dict for LLM synthesis.
 
-        # 5. Recent daily summaries (lower priority)
-        if remaining_budget > 200 and self.kb_exists():
-            recent = self._get_recent_summaries(current_date, max_history_days)
-            if recent:
-                truncated = recent[:min(len(recent), SECTION_BUDGETS['recent_summaries'])]
-                sections.append(("Recent Trading History", truncated))
-                remaining_budget -= len(truncated) + 50
+        Returns:
+            Dict mapping filename to content string. Empty files are excluded.
+        """
+        content = {}
+        max_file_chars = 20000  # Truncate individual files
 
-        # 6. Mistakes to avoid (lowest priority - included if space remains)
-        if remaining_budget > 100 and self.kb_exists():
-            mistakes = self._get_mistakes_summary()
-            if mistakes:
-                truncated = mistakes[:min(len(mistakes), remaining_budget - 50)]
-                sections.append(("Mistakes to Avoid", truncated))
-
-        # Build final context
-        context = self._build_context(sections, max_context_chars)
-
-        logger.debug(f"KB context built: {len(context)} chars, {len(sections)} sections")
-        return context
-
-    def _get_trading_rules(self) -> str:
-        """Extract trading rules from master index."""
+        # Master index (rules, patterns, stats)
         master_path = self.kb_root / "master_index.md"
-        if not master_path.exists():
-            return ""
+        if master_path.exists():
+            try:
+                text = master_path.read_text(encoding='utf-8')
+                if text.strip():
+                    content["master_index.md"] = text[:max_file_chars]
+            except UnicodeDecodeError:
+                pass
 
-        try:
-            content = master_path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
-            return ""  # Skip corrupted file
+        # Trade errors (never repeat rules)
+        errors_path = self.kb_root / "patterns" / "trade_errors.md"
+        if errors_path.exists():
+            try:
+                text = errors_path.read_text(encoding='utf-8')
+                if text.strip():
+                    content["trade_errors.md"] = text[:max_file_chars]
+            except UnicodeDecodeError:
+                pass
 
-        # Extract rules section
-        rules = []
+        # Mistakes
+        mistakes_path = self.kb_root / "patterns" / "mistakes.md"
+        if mistakes_path.exists():
+            try:
+                text = mistakes_path.read_text(encoding='utf-8')
+                if text.strip():
+                    content["mistakes.md"] = text[:max_file_chars]
+            except UnicodeDecodeError:
+                pass
 
-        if "### Buy Rules" in content:
-            buy_section = content.split("### Buy Rules")[1]
-            buy_section = buy_section.split("###")[0]  # Until next section
-            for line in buy_section.strip().split("\n"):
-                if line.startswith("- [x]"):  # Only learned rules
-                    rules.append(f"BUY: {line[6:].strip()}")
+        # Lessons learned
+        lessons_path = self.kb_root / "lessons_learned.md"
+        if lessons_path.exists():
+            try:
+                text = lessons_path.read_text(encoding='utf-8')
+                if text.strip():
+                    content["lessons_learned.md"] = text[:max_file_chars]
+            except UnicodeDecodeError:
+                pass
 
-        if "### Sell Rules" in content:
-            sell_section = content.split("### Sell Rules")[1]
-            sell_section = sell_section.split("###")[0]
-            for line in sell_section.strip().split("\n"):
-                if line.startswith("- [x]"):
-                    rules.append(f"SELL: {line[6:].strip()}")
-
-        if "### Hold Rules" in content:
-            hold_section = content.split("### Hold Rules")[1]
-            hold_section = hold_section.split("##")[0]
-            for line in hold_section.strip().split("\n"):
-                if line.startswith("- [x]"):
-                    rules.append(f"HOLD: {line[6:].strip()}")
-
-        if not rules:
-            return ""
-
-        return "\n".join(rules)
-
-    def _get_recent_summaries(self, current_date: str, max_days: int) -> str:
-        """Get summaries from recent trading days."""
+        # Recent sessions (daily summaries + decisions)
         sessions_dir = self.kb_root / "sessions"
-        if not sessions_dir.exists():
-            return ""
+        if sessions_dir.exists():
+            try:
+                dates = sorted([
+                    d.name for d in sessions_dir.iterdir()
+                    if d.is_dir() and d.name < current_date
+                ], reverse=True)
+            except Exception:
+                dates = []
 
-        # Get all session dates
-        try:
-            dates = sorted([
-                d.name for d in sessions_dir.iterdir()
-                if d.is_dir() and d.name < current_date
-            ], reverse=True)
-        except Exception:
-            return ""
+            for date in dates[:max_history_days]:
+                # Daily summary
+                summary_path = sessions_dir / date / "daily_summary.md"
+                if summary_path.exists():
+                    try:
+                        text = summary_path.read_text(encoding='utf-8')
+                        if text.strip():
+                            content[f"sessions/{date}/daily_summary.md"] = text[:max_file_chars]
+                    except UnicodeDecodeError:
+                        pass
 
-        if not dates:
-            return ""
+                # Decisions JSON
+                decisions_path = sessions_dir / date / "decisions.json"
+                if decisions_path.exists():
+                    try:
+                        text = decisions_path.read_text(encoding='utf-8')
+                        if text.strip():
+                            content[f"sessions/{date}/decisions.json"] = text[:max_file_chars]
+                    except UnicodeDecodeError:
+                        pass
 
-        summaries = []
-        for date in dates[:max_days]:
-            summary_path = sessions_dir / date / "daily_summary.md"
-            if summary_path.exists():
-                try:
-                    content = summary_path.read_text(encoding='utf-8')
-                except UnicodeDecodeError:
-                    continue  # Skip corrupted file
+        return content
 
-                # Extract key metrics
-                metrics = self._extract_metrics(content, date)
-                if metrics:
-                    summaries.append(metrics)
-
-        if not summaries:
-            return ""
-
-        return "\n".join(summaries)
-
-    def _extract_metrics(self, content: str, date: str) -> str:
-        """Extract key metrics from daily summary."""
-        lines = []
-        lines.append(f"[{date}]")
-
-        # Extract return
-        for line in content.split("\n"):
-            if "Day Return:" in line:
-                lines.append(f"  Return: {line.split(':')[1].strip()}")
-            elif "Average Skill Score:" in line:
-                lines.append(f"  Skill: {line.split(':')[1].strip()}")
-            elif "Average Luck Factor:" in line:
-                lines.append(f"  Luck: {line.split(':')[1].strip()}")
-
-        # Get lessons
-        if "## Lessons for Tomorrow" in content:
-            lessons_section = content.split("## Lessons for Tomorrow")[1]
-            lessons_section = lessons_section.split("---")[0]
-            for line in lessons_section.strip().split("\n"):
-                if line.startswith("- "):
-                    lines.append(f"  Lesson: {line[2:].strip()}")
-                    break  # Just first lesson
-
-        return "\n".join(lines) if len(lines) > 1 else ""
-
-    def _get_symbol_history(
+    def _llm_synthesize_context(
         self,
+        kb_content: Dict[str, str],
         symbols: List[str],
         current_date: str,
-        limit: int = 3
+        max_chars: int
     ) -> str:
-        """Get past decisions for specific symbols."""
-        sessions_dir = self.kb_root / "sessions"
-        if not sessions_dir.exists():
-            return ""
-
-        history = {sym: [] for sym in symbols}
-
-        try:
-            dates = sorted([
-                d.name for d in sessions_dir.iterdir()
-                if d.is_dir() and d.name < current_date
-            ], reverse=True)
-        except Exception:
-            return ""
-
-        for date in dates[:10]:  # Search last 10 days
-            decisions_path = sessions_dir / date / "decisions.json"
-            if not decisions_path.exists():
-                continue
-
-            try:
-                decisions = json.loads(decisions_path.read_text(encoding='utf-8'))
-                for d in decisions:
-                    sym = d.get('symbol')
-                    if sym in history and len(history[sym]) < limit:
-                        history[sym].append({
-                            "date": date,
-                            "action": d.get('action'),
-                            "skill": d.get('skill_score'),
-                            "profitable": d.get('profitable'),
-                            "lesson": d.get('lesson', '')[:50]
-                        })
-            except Exception:
-                continue
-
-        # Format output
-        lines = []
-        for sym, entries in history.items():
-            if entries:
-                lines.append(f"{sym}:")
-                for e in entries:
-                    status = "[Y]" if e['profitable'] else "[N]"
-                    lines.append(
-                        f"  [{e['date']}] {e['action']} (skill:{e['skill']}) {status}"
-                    )
-
-        return "\n".join(lines)
-
-    def _get_mistakes_summary(self) -> str:
-        """Get summary of mistakes to avoid."""
-        mistakes_path = self.kb_root / "patterns" / "mistakes.md"
-        if not mistakes_path.exists():
-            return ""
-
-        try:
-            content = mistakes_path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
-            return ""  # Skip corrupted file
-
-        # Extract recent critical errors
-        mistakes = []
-
-        if "## Critical Errors" in content:
-            errors_section = content.split("## Critical Errors")[1]
-            errors_section = errors_section.split("##")[0]
-
-            # Parse table rows
-            for line in errors_section.split("\n"):
-                if line.startswith("|") and "Date" not in line and "---" not in line:
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) >= 5:
-                        mistakes.append(f"- {parts[2]}: {parts[3]}")
-
-        if not mistakes:
-            return ""
-
-        return "Recent errors to avoid:\n" + "\n".join(mistakes[:5])
-
-    def _get_never_repeat_rules(self) -> str:
         """
-        Get assertive Never Repeat Rules from trade_errors.md.
+        Use LLM to synthesize relevant trading context from raw KB files.
 
-        Returns rules formatted with strong warning language to prevent
-        the AI from making the same mistakes.
+        Args:
+            kb_content: Dict of {filename: content}
+            symbols: Symbols being traded today
+            current_date: Current date
+            max_chars: Maximum characters for output
+
+        Returns:
+            Synthesized context string, or empty string on failure
         """
-        errors_path = self.kb_root / "patterns" / "trade_errors.md"
-        if not errors_path.exists():
-            return ""
+        from src.api import ai
 
-        try:
-            content = errors_path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
-            return ""
+        # Build the KB dump for the prompt
+        kb_dump = ""
+        for filename, text in kb_content.items():
+            kb_dump += f"\n--- {filename} ---\n{text}\n"
 
-        if "## Never Repeat Rules" not in content:
-            return ""
+        symbols_str = ", ".join(symbols) if symbols else "all watchlist symbols"
 
-        rules_section = content.split("## Never Repeat Rules")[1]
-        # Split on footer marker (standalone ---) not table separator (|---|)
-        if "\n---\n" in rules_section:
-            rules_section = rules_section.split("\n---\n")[0]
-        elif "\n---" in rules_section and "|---" not in rules_section.split("\n---")[0][-10:]:
-            rules_section = rules_section.split("\n---")[0]
+        prompt = f"""You are a trading knowledge base assistant. Today is {current_date}.
+The trader is considering these symbols: {symbols_str}
 
-        # Parse table rows and format assertively
-        rules = []
-        seen_patterns = set()
+Below is the full content of the trading knowledge base. Your job is to extract and synthesize
+the most relevant information for today's trading decisions.
 
-        for line in rules_section.split("\n"):
-            if line.startswith("|") and "Pattern" not in line and "---" not in line:
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 4:
-                    pattern = parts[1]  # e.g., "[CRITICAL] BUY NVDA when skill<60"
-                    reason = parts[2]   # e.g., "Failed 18x - Bad decision + bad luck"
+{kb_dump}
 
-                    # Extract core pattern to avoid duplicates in output
-                    core_pattern = pattern.replace("[CRITICAL] ", "").strip()
-                    if core_pattern in seen_patterns:
-                        continue
-                    seen_patterns.add(core_pattern)
+Produce a concise trading context summary (max {max_chars} characters) with these sections:
 
-                    # Format assertively
-                    if "[CRITICAL]" in pattern or "Failed" in reason:
-                        rules.append(f"[!] NEVER: {core_pattern} - {reason}")
-                    else:
-                        rules.append(f"[WARNING] AVOID: {core_pattern} - {reason}")
+1. **CRITICAL RULES** - Any "never repeat" rules, critical errors, or blocked actions relevant to these symbols
+2. **LEARNED PATTERNS** - Buy/sell/hold rules that have worked before, especially for these symbols
+3. **RECENT HISTORY** - Key metrics from recent trading days (returns, skill scores, lessons)
+4. **SYMBOL CONTEXT** - Past decisions and outcomes for the specific symbols being considered
 
-        if not rules:
-            return ""
+Rules:
+- Be concise and assertive. Use imperative language ("NEVER buy X when...", "SELL when...")
+- Prioritize actionable rules over general observations
+- If a mistake has been repeated multiple times, emphasize it strongly
+- Include specific numbers (skill scores, P/L, dates) when relevant
+- Skip sections that have no relevant content
+- Do NOT wrap in markdown code blocks
+- Output plain markdown text only"""
 
-        header = "[!][!] CRITICAL RULES - DO NOT VIOLATE [!][!]\n"
-        return header + "\n".join(rules[:10])  # Limit to top 10 most important
+        response = ai.make_ai_request(prompt)
+        result = ai.get_raw_response_content(response)
+
+        # Truncate to budget
+        if len(result) > max_chars:
+            result = result[:max_chars - 3] + "..."
+
+        return result
 
     def _build_context(
         self,

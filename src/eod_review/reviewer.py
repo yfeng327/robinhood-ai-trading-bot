@@ -18,7 +18,7 @@ from src.kb import KBWriter, KBReader, DecisionAnalyzer
 from src.kb.analyzer import analyze_day_decisions, DecisionAnalysis
 from src.kb.lesson_generator import generate_lessons_with_llm
 from src.day_trading.decision_buffer import DecisionBuffer
-from .deduplicator import LessonDeduplicator
+from .deduplicator import deduplicate_lessons_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -138,11 +138,16 @@ class EODReviewer:
         # Generate lessons from analyses (uses LLM with intraday context)
         lessons = self._generate_lessons(analyses, intraday_timelines)
         
-        # Deduplicate lessons
-        unique_lessons, duplicates = self._deduplicate_lessons(lessons)
-        
-        logger.info(f"Generated {len(lessons)} lessons, {len(unique_lessons)} unique after dedup")
-        
+        # Deduplicate lessons against existing KB
+        unique_lessons, merged_lessons = self._deduplicate_lessons(lessons)
+
+        duplicates_dropped = len(lessons) - len(unique_lessons) - len(merged_lessons)
+        logger.info(
+            f"Generated {len(lessons)} lessons: "
+            f"{len(unique_lessons)} new, {len(merged_lessons)} merged, "
+            f"{duplicates_dropped} dropped"
+        )
+
         # Write to KB
         self._write_to_kb(
             date=trade_date,
@@ -151,16 +156,17 @@ class EODReviewer:
             analyses=analyses,
             holdings=current_holdings,
             cash=current_cash,
-            unique_lessons=unique_lessons
+            unique_lessons=unique_lessons,
+            merged_lessons=merged_lessons
         )
-        
+
         # Clear the decision buffer
         self.decision_buffer.clear_buffer()
-        
+
         # Run KB compaction to clean up duplicates
         logger.info("Running KB compaction...")
         self.kb_writer.compact_kb_files()
-        
+
         return {
             'date': trade_date,
             'decisions': len(decisions),
@@ -168,7 +174,8 @@ class EODReviewer:
             'analyses': len(analyses),
             'lessons_generated': len(lessons),
             'lessons_written': len(unique_lessons),
-            'duplicates_removed': len(duplicates),
+            'lessons_merged': len(merged_lessons),
+            'duplicates_removed': duplicates_dropped,
         }
     
     def _get_current_prices(self, decisions: List[Dict]) -> Dict[str, float]:
@@ -371,24 +378,18 @@ class EODReviewer:
     
     def _deduplicate_lessons(self, lessons: List[str]) -> tuple:
         """
-        Remove duplicate lessons using pattern matching.
-        
+        Remove duplicate lessons using LLM-based semantic comparison.
+
         Args:
             lessons: New lessons to deduplicate
-            
+
         Returns:
-            Tuple of (unique lessons, duplicates)
+            Tuple of:
+            - unique_lessons: New lessons to append
+            - merged_lessons: List of (old_lesson, new_merged_lesson) for replacement
         """
-        # Load existing lessons from KB
         existing = self._load_existing_lessons()
-        
-        deduplicator = LessonDeduplicator(existing)
-        unique, duplicates = deduplicator.filter_duplicates(lessons)
-        
-        # Consolidate similar new lessons
-        unique = deduplicator.consolidate_similar(unique)
-        
-        return unique, duplicates
+        return deduplicate_lessons_with_llm(lessons, existing)
     
     def _load_existing_lessons(self) -> List[str]:
         """Load existing lessons from KB files."""
@@ -434,11 +435,12 @@ class EODReviewer:
         analyses: List[DecisionAnalysis],
         holdings: Dict[str, float],
         cash: float,
-        unique_lessons: List[str]
+        unique_lessons: List[str],
+        merged_lessons: List[tuple] = None
     ):
         """Write consolidated daily summary to KB."""
         logger.info(f"Writing daily summary for {date} to KB...")
-        
+
         # Use existing KBWriter method for daily summary
         self.kb_writer.write_daily_summary(
             date=date,
@@ -448,13 +450,64 @@ class EODReviewer:
             portfolio_holdings=holdings,
             cash=cash
         )
-        
-        # Write unique lessons to lessons_learned.md
+
+        # Apply merged lesson replacements in lessons_learned.md
+        if merged_lessons:
+            self._apply_merges(merged_lessons, date)
+
+        # Append new unique lessons to lessons_learned.md
         if unique_lessons:
             self._append_lessons(unique_lessons, date)
-        
-        logger.info(f"KB write complete: {len(analyses)} analyses, {len(unique_lessons)} lessons")
+
+        logger.info(
+            f"KB write complete: {len(analyses)} analyses, "
+            f"{len(unique_lessons)} new lessons, "
+            f"{len(merged_lessons or [])} merged lessons"
+        )
     
+    def _apply_merges(self, merged_lessons: List[tuple], date: str):
+        """
+        Replace existing lessons with merged versions in lessons_learned.md.
+
+        Args:
+            merged_lessons: List of (old_lesson, new_merged_lesson) tuples
+            date: Current date for the updated entry
+        """
+        lessons_path = self.kb_reader.kb_root / "lessons_learned.md"
+
+        try:
+            if not lessons_path.exists():
+                return
+
+            content = lessons_path.read_text()
+
+            for old_lesson, new_merged in merged_lessons:
+                # Find the line containing the old lesson and replace it
+                # Lessons are stored as "- [DATE] lesson text..."
+                # We need to match the lesson text portion (after the date prefix)
+                old_escaped = old_lesson.replace('\\', '\\\\')
+                lines = content.split('\n')
+                replaced = False
+                for i, line in enumerate(lines):
+                    # Strip the "- [DATE] " prefix to compare lesson content
+                    stripped = line.strip()
+                    if stripped.startswith('-') and old_lesson in stripped:
+                        lines[i] = f"- [{date}] {new_merged}"
+                        replaced = True
+                        logger.debug(f"Merged lesson: {old_lesson[:60]}... -> {new_merged[:60]}...")
+                        break
+
+                if replaced:
+                    content = '\n'.join(lines)
+                else:
+                    logger.debug(f"Could not find lesson to merge: {old_lesson[:80]}...")
+
+            lessons_path.write_text(content)
+            logger.info(f"Applied {len(merged_lessons)} lesson merges in lessons_learned.md")
+
+        except Exception as e:
+            logger.error(f"Error applying lesson merges: {e}")
+
     def _append_lessons(self, lessons: List[str], date: str):
         """Append unique lessons to lessons_learned.md."""
         lessons_path = self.kb_reader.kb_root / "lessons_learned.md"

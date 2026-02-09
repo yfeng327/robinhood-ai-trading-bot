@@ -1,5 +1,5 @@
 import robin_stocks.robinhood as rh
-import robin_stocks.urls as rh_urls
+import robin_stocks.robinhood.urls as rh_urls
 import time
 from datetime import datetime
 from pytz import timezone
@@ -47,6 +47,16 @@ async def login_to_robinhood():
         logger.error(f"Login failed - unexpected response: {login_resp}")
         return None
 
+    except KeyError as e:
+        # robin_stocks raises KeyError when Robinhood returns 403 (e.g. MFA required)
+        logger.error(
+            f"Robinhood login failed with KeyError: {e}. "
+            f"This usually means the cached session (pickle) expired and a fresh login "
+            f"was rejected by Robinhood (403). If MFA is enabled on your account, set "
+            f"ROBINHOOD_MFA_SECRET in config.py to your TOTP secret so the bot can "
+            f"generate MFA codes automatically."
+        )
+        return None
     except Exception as e:
         logger.error(f"An error occurred during Robinhood login: {e}")
         return None
@@ -312,7 +322,7 @@ def get_stock_day_trade_checks(symbol):
     stock_id = rh_run_with_retries(rh.helper.id_for_stock, symbol)
     url = account_info_cache["url"] + 'day_trade_checks'
     params = {
-        "instrument": rh_urls.instruments() + stock_id + "/"
+        "instrument": rh_urls.instruments_url() + stock_id + "/"
     }
     resp = rh_run_with_retries(rh.request_get, url, payload=params)
     return resp

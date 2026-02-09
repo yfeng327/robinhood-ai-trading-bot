@@ -9,10 +9,10 @@ This module runs once at market close (or on-demand) and:
 """
 
 from .reviewer import EODReviewer, run_eod_review
-from .deduplicator import LessonDeduplicator
+from .deduplicator import deduplicate_lessons_with_llm
 
 __all__ = [
     'EODReviewer',
     'run_eod_review',
-    'LessonDeduplicator',
+    'deduplicate_lessons_with_llm',
 ]

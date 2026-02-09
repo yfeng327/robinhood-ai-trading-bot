@@ -29,6 +29,9 @@ else:
 def make_ai_request(prompt):
     """Make AI request to the configured provider."""
     logger.info(f"[LLM REQUEST] Provider: {AI_PROVIDER}, Model: {model_name}, Prompt length: {len(prompt)} chars")
+    # Log prompt preview at INFO level for visibility
+    prompt_preview = prompt[:800] + "\n... [truncated]" if len(prompt) > 800 else prompt
+    logger.info(f"[LLM REQUEST] Prompt preview:\n{prompt_preview}")
     logger.debug(f"[LLM REQUEST] Full prompt:\n{prompt}")
 
     if AI_PROVIDER == "gemini":

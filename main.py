@@ -180,8 +180,9 @@ def run_eod_review_cycle():
     logger.info(f"EOD Review Complete:")
     logger.info(f"  - Decisions analyzed: {results.get('successful', 0)}")
     logger.info(f"  - Lessons generated: {results.get('lessons_generated', 0)}")
-    logger.info(f"  - Lessons written: {results.get('lessons_written', 0)}")
-    logger.info(f"  - Duplicates removed: {results.get('duplicates_removed', 0)}")
+    logger.info(f"  - Lessons written (new): {results.get('lessons_written', 0)}")
+    logger.info(f"  - Lessons merged: {results.get('lessons_merged', 0)}")
+    logger.info(f"  - Duplicates dropped: {results.get('duplicates_removed', 0)}")
     
     # Publish to web UI if enabled
     if WEB_UI_ENABLED:
@@ -292,8 +293,20 @@ async def main():
                 login_resp = await robinhood.login_to_robinhood()
                 if not login_resp or 'expires_in' not in login_resp:
                     raise Exception("Failed to login to Robinhood")
-                robinhood_token_expiry = time.time() + login_resp['expires_in']
-                logger.info(f"Logged in. Token expires in {login_resp['expires_in']}s")
+
+                # robin_stocks returns expires_in=86400 even for pickle-cached
+                # tokens, regardless of actual remaining validity. Use a
+                # conservative expiry for pickle logins to catch stale tokens.
+                detail = login_resp.get('detail', '')
+                if 'logged in using authentication' in str(detail):
+                    # Pickle-cached login — re-validate after 2 cycles
+                    effective_expiry = RUN_INTERVAL_SECONDS * 2
+                    logger.info(f"Logged in (cached). Will re-validate in {effective_expiry}s")
+                else:
+                    effective_expiry = login_resp['expires_in']
+                    logger.info(f"Logged in (fresh). Token expires in {effective_expiry}s")
+
+                robinhood_token_expiry = time.time() + effective_expiry
             
             run_interval = RUN_INTERVAL_SECONDS
             
@@ -307,6 +320,8 @@ async def main():
             
         except Exception as e:
             run_interval = 60
+            # Force re-login on next iteration — token may be expired/invalid
+            robinhood_token_expiry = 0
             logger.error(f"Trading bot error: {e}")
         
         logger.info(f"Waiting for {run_interval} seconds...")

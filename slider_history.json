@@ -1,0 +1,15 @@
+[
+  {
+    "timestamp": "2026-02-09T01:48:17.373183-05:00",
+    "slider": 0.35,
+    "confidence": 0.71,
+    "strategy_results": {
+      "gap_trading": 0.85,
+      "mean_reversion": -0.2,
+      "ttm_squeeze": 0.68,
+      "orb": 0.85,
+      "deepseek": -0.2
+    },
+    "pnl": 0.0
+  }
+]

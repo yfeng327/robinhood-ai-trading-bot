@@ -126,6 +126,7 @@ The AI should consult this before making decisions.
 ---
 *Last updated: Never*
 """
+        self.kb_root.mkdir(parents=True, exist_ok=True)
         (self.kb_root / "master_index.md").write_text(content, encoding='utf-8')
 
     def _write_initial_lessons(self):
@@ -153,6 +154,7 @@ The AI should consult this before making decisions.
 ---
 *This file is updated after each trading day with significant learnings.*
 """
+        self.kb_root.mkdir(parents=True, exist_ok=True)
         (self.kb_root / "lessons_learned.md").write_text(content, encoding='utf-8')
 
     def _write_initial_mistakes(self):
@@ -184,7 +186,9 @@ The AI should consult this before making decisions.
 ---
 *Consult this file before every trading decision.*
 """
-        (self.kb_root / "patterns" / "mistakes.md").write_text(content, encoding='utf-8')
+        patterns_dir = self.kb_root / "patterns"
+        patterns_dir.mkdir(parents=True, exist_ok=True)
+        (patterns_dir / "mistakes.md").write_text(content, encoding='utf-8')
 
     # =========================================================================
     # DEDUPLICATION HELPERS
@@ -634,6 +638,146 @@ The AI should consult this before making decisions.
         # Run end-of-day compaction to consolidate duplicates and enforce limits
         self.compact_kb_files()
 
+    def _aggregate_trades(self, analyses: List[DecisionAnalysis]) -> Dict[Tuple[str, str], Dict]:
+        """
+        Group trades by (symbol, action) and aggregate metrics.
+
+        Returns dict keyed by (symbol, action) with aggregated stats:
+        count, total_qty, total_pl, avg_skill, avg_luck, avg_price,
+        right_reasons (Counter), wrong_reasons (Counter).
+        """
+        from collections import Counter
+
+        groups: Dict[Tuple[str, str], Dict] = {}
+
+        for a in analyses:
+            key = (a.symbol, a.action)
+            if key not in groups:
+                groups[key] = {
+                    "count": 0,
+                    "total_qty": 0.0,
+                    "total_pl": 0.0,
+                    "skill_sum": 0,
+                    "luck_sum": 0.0,
+                    "price_sum": 0.0,
+                    "profitable_count": 0,
+                    "right_reasons": Counter(),
+                    "wrong_reasons": Counter(),
+                }
+            g = groups[key]
+            g["count"] += 1
+            g["total_qty"] += a.quantity
+            g["total_pl"] += a.profit_loss if a.profit_loss else 0
+            g["skill_sum"] += a.skill_score
+            g["luck_sum"] += a.luck_factor
+            g["price_sum"] += a.price
+            if a.profitable:
+                g["profitable_count"] += 1
+            if a.what_went_right:
+                g["right_reasons"][a.what_went_right] += 1
+            if a.what_went_wrong:
+                g["wrong_reasons"][a.what_went_wrong] += 1
+
+        # Compute averages
+        for key, g in groups.items():
+            n = g["count"]
+            g["avg_skill"] = g["skill_sum"] / n
+            g["avg_luck"] = g["luck_sum"] / n
+            g["avg_price"] = g["price_sum"] / n
+
+        return groups
+
+    def _compress_summary_with_llm(
+        self, aggregated: Dict[Tuple[str, str], Dict], date: str
+    ) -> Tuple[str, str]:
+        """
+        Use LLM to synthesize concise What Went Right / What Went Wrong bullets.
+
+        Returns (right_markdown, wrong_markdown).
+        Raises on failure so caller can fall back.
+        """
+        from src.api import ai
+
+        # Build a compact summary for the LLM
+        trade_summaries = []
+        for (symbol, action), g in aggregated.items():
+            top_right = [f'"{r}" (x{c})' for r, c in g["right_reasons"].most_common(3)]
+            top_wrong = [f'"{r}" (x{c})' for r, c in g["wrong_reasons"].most_common(3)]
+            trade_summaries.append({
+                "symbol": symbol,
+                "action": action,
+                "count": g["count"],
+                "total_qty": round(g["total_qty"], 2),
+                "total_pl": round(g["total_pl"], 2),
+                "avg_skill": round(g["avg_skill"]),
+                "avg_luck_pct": round(g["avg_luck"] * 100),
+                "avg_price": round(g["avg_price"], 2),
+                "profitable_count": g["profitable_count"],
+                "top_right_reasons": top_right,
+                "top_wrong_reasons": top_wrong,
+            })
+
+        prompt = f"""You are a trading journal assistant. Given aggregated trade data for {date}, produce concise summary bullets.
+
+Trade data:
+{json.dumps(trade_summaries, indent=2)}
+
+Return a JSON object with exactly two keys:
+- "right": array of 1-3 concise markdown bullet strings for What Went Right (focus on profitable groups)
+- "wrong": array of 1-3 concise markdown bullet strings for What Went Wrong (focus on losing groups)
+
+Each bullet should mention the symbol, key stats (trade count, P/L, skill score), and the core reason.
+Use **bold** for symbol names. Be specific and concise - no filler words.
+Return ONLY valid JSON, no markdown code blocks."""
+
+        response = ai.make_ai_request(prompt)
+        result = ai.parse_ai_response(response)
+
+        right_bullets = result.get("right", [])
+        wrong_bullets = result.get("wrong", [])
+
+        right_str = "\n".join(f"- {b}" for b in right_bullets) if right_bullets else "- No clearly successful decisions today"
+        wrong_str = "\n".join(f"- {b}" for b in wrong_bullets) if wrong_bullets else "- No significant errors today"
+
+        return right_str, wrong_str
+
+    def _fallback_compress_summary(
+        self, aggregated: Dict[Tuple[str, str], Dict]
+    ) -> Tuple[str, str]:
+        """
+        Programmatic fallback: deduplicate right/wrong reasons by counting occurrences.
+
+        Returns (right_markdown, wrong_markdown).
+        """
+        right_lines = []
+        wrong_lines = []
+
+        for (symbol, action), g in sorted(aggregated.items(), key=lambda x: abs(x[1]["total_pl"]), reverse=True):
+            # What went right: groups with net profit
+            if g["total_pl"] > 0 and g["right_reasons"]:
+                top_reason, top_count = g["right_reasons"].most_common(1)[0]
+                count_note = f" ({top_count}x)" if g["count"] > 1 else ""
+                pl_str = f"+${g['total_pl']:,.2f}"
+                right_lines.append(
+                    f"- **{symbol}** ({action}): {g['count']} trades, {pl_str} total P/L, "
+                    f"avg skill={g['avg_skill']:.0f}{count_note} - {top_reason[:80]}"
+                )
+
+            # What went wrong: groups with net loss
+            if g["total_pl"] < 0 and g["wrong_reasons"]:
+                top_reason, top_count = g["wrong_reasons"].most_common(1)[0]
+                count_note = f" ({top_count}x)" if g["count"] > 1 else ""
+                pl_str = f"-${abs(g['total_pl']):,.2f}"
+                wrong_lines.append(
+                    f"- **{symbol}** ({action}): {g['count']} trades, {pl_str} total P/L, "
+                    f"avg skill={g['avg_skill']:.0f}{count_note} - {top_reason[:80]}"
+                )
+
+        right_str = "\n".join(right_lines[:5]) if right_lines else "- No clearly successful decisions today"
+        wrong_str = "\n".join(wrong_lines[:5]) if wrong_lines else "- No significant errors today"
+
+        return right_str, wrong_str
+
     def _generate_daily_summary(
         self,
         date: str,
@@ -647,27 +791,31 @@ The AI should consult this before making decisions.
         holdings: Dict[str, float],
         cash: float
     ) -> str:
-        """Generate daily summary markdown."""
+        """Generate daily summary markdown with aggregated trades and compressed insights."""
 
-        # Build decisions table
-        decisions_table = "| Symbol | Action | Qty | Price | P/L | Skill | Luck |\n"
-        decisions_table += "|--------|--------|-----|-------|-----|-------|------|\n"
+        # Aggregate trades by (symbol, action)
+        aggregated = self._aggregate_trades(analyses)
 
-        for a in analyses:
-            pl_str = f"${a.profit_loss:+.2f}" if a.profit_loss else "N/A"
-            decisions_table += f"| {a.symbol} | {a.action} | {a.quantity:.4f} | ${a.price:.2f} | {pl_str} | {a.skill_score} | {a.luck_factor:.0%} |\n"
+        # Build aggregated decisions table
+        decisions_table = "| Symbol | Action | Trades | Total Qty | Total P/L | Avg Skill | Avg Luck |\n"
+        decisions_table += "|--------|--------|--------|-----------|-----------|-----------|----------|\n"
 
-        # What went right
-        right_list = "\n".join([f"- **{a.symbol}**: {a.what_went_right}" for a in analyses if a.profitable])
-        if not right_list:
-            right_list = "- No clearly successful decisions today"
+        for (symbol, action), g in sorted(aggregated.items()):
+            pl_str = f"${g['total_pl']:+,.2f}"
+            decisions_table += (
+                f"| {symbol} | {action} | {g['count']} | {g['total_qty']:,.2f} "
+                f"| {pl_str} | {g['avg_skill']:.0f} | {g['avg_luck']:.0%} |\n"
+            )
 
-        # What went wrong
-        wrong_list = "\n".join([f"- **{a.symbol}**: {a.what_went_wrong}" for a in analyses if not a.profitable])
-        if not wrong_list:
-            wrong_list = "- No significant errors today"
+        # Compress What Went Right / What Went Wrong
+        try:
+            right_list, wrong_list = self._compress_summary_with_llm(aggregated, date)
+            logger.info("Daily summary compressed via LLM")
+        except Exception as e:
+            logger.warning(f"LLM compression failed, using fallback: {e}")
+            right_list, wrong_list = self._fallback_compress_summary(aggregated)
 
-        # Lessons for tomorrow
+        # Lessons for tomorrow (deduplicated)
         lessons = set(a.lesson_learned for a in analyses)
         lessons_list = "\n".join([f"- {l}" for l in lessons])
 
@@ -920,6 +1068,8 @@ The AI should consult this before making decisions.
         Now includes duplicate checking to prevent bloat.
         """
         master_path = self.kb_root / "master_index.md"
+        if not master_path.exists():
+            self._write_initial_master_index()
         try:
             content = master_path.read_text(encoding='utf-8')
         except UnicodeDecodeError:
@@ -1016,6 +1166,8 @@ The AI should consult this before making decisions.
     def _update_lessons_if_significant(self, date: str, analyses: List[DecisionAnalysis]):
         """Update lessons learned based on quadrant classification."""
         lessons_path = self.kb_root / "lessons_learned.md"
+        if not lessons_path.exists():
+            self._write_initial_lessons()
         try:
             content = lessons_path.read_text(encoding='utf-8')
         except UnicodeDecodeError:
@@ -1077,6 +1229,8 @@ The AI should consult this before making decisions.
     def _update_mistakes(self, date: str, analyses: List[DecisionAnalysis]):
         """Update mistakes file based on Q2/Q4 quadrants (poor decisions)."""
         mistakes_path = self.kb_root / "patterns" / "mistakes.md"
+        if not mistakes_path.exists():
+            self._write_initial_mistakes()
         try:
             content = mistakes_path.read_text(encoding='utf-8')
         except UnicodeDecodeError:
