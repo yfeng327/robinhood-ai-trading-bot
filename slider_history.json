@@ -1,14 +1,27 @@
 [
   {
-    "timestamp": "2026-02-09T01:48:17.373183-05:00",
-    "slider": 0.35,
-    "confidence": 0.71,
+    "timestamp": "2026-02-10T11:37:20.023670-05:00",
+    "slider": 0.0,
+    "confidence": 0.2,
     "strategy_results": {
-      "gap_trading": 0.85,
-      "mean_reversion": -0.2,
-      "ttm_squeeze": 0.68,
-      "orb": 0.85,
-      "deepseek": -0.2
+      "overnight": 0.0,
+      "gap_trading": 0.0,
+      "orb": 0.0,
+      "ttm_squeeze": -0.05,
+      "mean_reversion": 0.0
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-02-10T11:43:31.895930-05:00",
+    "slider": 0.0,
+    "confidence": 0.0,
+    "strategy_results": {
+      "overnight": 0.0,
+      "gap_trading": 0.0,
+      "orb": 0.0,
+      "ttm_squeeze": -0.05,
+      "mean_reversion": 0.0
     },
     "pnl": 0.0
   }

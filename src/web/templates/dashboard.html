@@ -1,13 +1,23 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trading Bot Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* UI Only Mode - Hide non-slider elements */
+        body.ui-only .row,
+        body.ui-only .eod-review,
+        body.ui-only .event-log {
+            display: none !important;
+        }
+    </style>
 </head>
-<body>
+
+<body class="{{ ui_mode }}">
     <div class="container">
         <!-- Header -->
         <header class="header">
@@ -26,6 +36,75 @@
 
         <!-- Main Content -->
         <main class="main-content">
+            <!-- Slider Bot Panel -->
+            <div class="slider-dashboard hidden" id="slider-dashboard">
+                <!-- Gauge Section -->
+                <div class="slider-gauge-section">
+                    <h2>Slider Bot</h2>
+                    <div class="gauge-container">
+                        <div class="gauge-arc"></div>
+                        <div class="gauge-fill" id="slider-gauge-fill"></div>
+                        <div class="gauge-value" id="slider-value">0.00</div>
+                    </div>
+                    <div class="slider-action-badge" id="slider-action">NEUTRAL</div>
+                    <div class="market-info-grid">
+                        <div class="market-stat">
+                            <span class="label">QQQ Price</span>
+                            <span class="value" id="market-price">--</span>
+                        </div>
+                        <div class="market-stat">
+                            <span class="label">Session</span>
+                            <span class="value" id="market-session">--</span>
+                        </div>
+                    </div>
+                    <div style="margin-top: 10px; font-size: 11px; color: var(--text-muted);" id="slider-updated">
+                        Updated: --
+                    </div>
+                </div>
+
+                <!-- Strategy Section -->
+                <div class="strategy-section">
+                    <div class="section-title">
+                        <span>Strategy Confluence</span>
+                        <span id="slider-confidence">0% Conf</span>
+                    </div>
+                    <table class="strategy-table">
+                        <thead>
+                            <tr>
+                                <th>Strategy</th>
+                                <th>Signal</th>
+                                <th>Reasoning</th>
+                            </tr>
+                        </thead>
+                        <tbody id="strategy-list">
+                            <!-- Populated via JS -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Benchmark & Portfolio -->
+                <div class="benchmark-section">
+                    <div class="portfolio-overview">
+                        <div class="portfolio-val" id="portfolio-value">--</div>
+                        <div class="label"
+                            style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Demo
+                            Portfolio</div>
+                        <div style="margin-top: 8px; font-size: 14px;">
+                            PnL: <span id="portfolio-pnl">--</span>
+                        </div>
+                    </div>
+
+                    <div class="section-title">Benchmarks (Return)</div>
+                    <div id="benchmark-list">
+                        <!-- Populated via JS -->
+                    </div>
+
+                    <button class="btn btn-secondary" id="reset-button" onclick="resetSliderBot()"
+                            style="margin-top: 16px; width: 100%; font-size: 12px;">
+                        🔄 Reset (Start Fresh)
+                    </button>
+                </div>
+            </div>
             <!-- Top Row -->
             <div class="row">
                 <!-- Live Trading Panel -->
@@ -127,13 +206,18 @@
         let eventSource = null;
         let tradeCount = 0;
         let lastEODResults = null;
+        let lastSliderUpdate = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             updateTime();
             setInterval(updateTime, 1000);
-            
+
+            // Poll for slider status every 5 seconds (fallback/ensure freshness)
+            setInterval(fetchSliderStatus, 5000);
+
             fetchInitialData();
+            fetchSliderStatus();
             connectSSE();
             setupTabs();
         });
@@ -141,18 +225,35 @@
         // Time display
         function updateTime() {
             const now = new Date();
-            document.getElementById('current-time').textContent = 
+            document.getElementById('current-time').textContent =
                 now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+            // Update relative time
+            if (lastSliderUpdate) {
+                const diff = Math.floor((now - lastSliderUpdate) / 1000);
+                const timeStr = lastSliderUpdate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+                let ago = `${diff}s ago`;
+                if (diff > 60) ago = `${Math.floor(diff / 60)}m ${diff % 60}s ago`;
+                if (diff > 3600) ago = `${Math.floor(diff / 3600)}h ago`;
+
+                const el = document.getElementById('slider-updated');
+                el.textContent = `Updated: ${timeStr} (${ago})`;
+
+                // Alert color if stale (> 5 mins)
+                if (diff > 300) el.style.color = 'var(--error)';
+                else el.style.color = 'var(--text-muted)';
+            }
         }
 
         // SSE Connection
         function connectSSE() {
             eventSource = new EventSource('/api/stream');
-            
+
             eventSource.onopen = () => {
                 setStatus('live', 'Live');
             };
-            
+
             eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
@@ -161,7 +262,7 @@
                     console.error('SSE parse error:', e);
                 }
             };
-            
+
             eventSource.onerror = () => {
                 setStatus('offline', 'Disconnected');
                 setTimeout(connectSSE, 5000);
@@ -171,7 +272,7 @@
         // Handle incoming events
         function handleEvent(event) {
             addLogEntry(event);
-            
+
             switch (event.type) {
                 case 'trade':
                     addTrade(event.data);
@@ -181,6 +282,9 @@
                     break;
                 case 'eod_review':
                     updateEODResults(event.data);
+                    break;
+                case 'slider_update':
+                    updateSliderUI(event.data);
                     break;
             }
         }
@@ -193,22 +297,22 @@
                 const status = await statusRes.json();
                 document.getElementById('buffered-count').textContent = status.buffered_decisions || 0;
                 if (status.running) setStatus('live', 'Live');
-                
+
                 // Decisions
                 const decisionsRes = await fetch('/api/decisions');
                 const decisions = await decisionsRes.json();
                 document.getElementById('decisions-count').textContent = decisions.count || 0;
-                
+
                 // Lessons
                 const lessonsRes = await fetch('/api/lessons');
                 const lessons = await lessonsRes.json();
                 updateLessons(lessons);
-                
+
                 // History
                 const historyRes = await fetch('/api/history');
                 const history = await historyRes.json();
                 history.events.forEach(e => addLogEntry(e, true));
-                
+
             } catch (e) {
                 console.error('Fetch error:', e);
             }
@@ -218,15 +322,15 @@
         function updateLessons(lessons) {
             const worksList = document.getElementById('lessons-works');
             const doesntList = document.getElementById('lessons-doesnt');
-            
-            worksList.innerHTML = lessons.what_works.length ? 
+
+            worksList.innerHTML = lessons.what_works.length ?
                 lessons.what_works.map(l => `<li>${escapeHtml(l)}</li>`).join('') :
                 '<li class="empty-state">No lessons yet</li>';
-            
+
             doesntList.innerHTML = lessons.what_doesnt.length ?
                 lessons.what_doesnt.map(l => `<li>${escapeHtml(l)}</li>`).join('') :
                 '<li class="empty-state">No lessons yet</li>';
-            
+
             document.getElementById('lessons-badge').textContent = `${lessons.total} total`;
         }
 
@@ -235,7 +339,7 @@
             const list = document.getElementById('trades-list');
             const empty = list.querySelector('.empty-state');
             if (empty) empty.remove();
-            
+
             const entry = document.createElement('div');
             entry.className = `trade-entry ${trade.result}`;
             entry.innerHTML = `
@@ -245,7 +349,7 @@
                 <span class="trade-result">${trade.result === 'success' ? '✓' : '✗'}</span>
             `;
             list.insertBefore(entry, list.firstChild);
-            
+
             tradeCount++;
             document.getElementById('decisions-count').textContent = tradeCount;
         }
@@ -253,9 +357,9 @@
         // Update cycle stats
         function updateCycleStats(data) {
             const now = new Date();
-            document.getElementById('cycle-badge').textContent = 
+            document.getElementById('cycle-badge').textContent =
                 `Last: ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
-            
+
             // Add trades from cycle
             [...(data.bought || []), ...(data.sold || [])].forEach(t => {
                 addTrade({
@@ -272,11 +376,11 @@
             const btn = document.getElementById('eod-button');
             btn.disabled = true;
             btn.textContent = 'Running...';
-            
+
             try {
                 const res = await fetch('/api/eod-review', { method: 'POST' });
                 const data = await res.json();
-                
+
                 if (data.success) {
                     updateEODResults(data.results);
                     showNotification('EOD Review completed successfully!', 'success');
@@ -294,14 +398,14 @@
         // Update EOD results
         function updateEODResults(results) {
             lastEODResults = results;
-            
+
             const now = new Date();
-            document.getElementById('eod-last-run').textContent = 
+            document.getElementById('eod-last-run').textContent =
                 now.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             document.getElementById('eod-decisions').textContent = results.successful || results.decisions || 0;
             document.getElementById('eod-lessons').textContent = results.lessons_written || 0;
             document.getElementById('eod-dupes').textContent = results.duplicates_removed || 0;
-            
+
             // Refresh lessons
             fetch('/api/lessons')
                 .then(r => r.json())
@@ -313,25 +417,25 @@
             const list = document.getElementById('log-list');
             const waiting = list.querySelector('.log-entry.info');
             if (waiting && waiting.textContent.includes('Waiting')) waiting.remove();
-            
+
             const entry = document.createElement('div');
             entry.className = `log-entry ${event.type || 'info'}`;
-            
-            const time = new Date(event.timestamp).toLocaleTimeString('en-US', 
+
+            const time = new Date(event.timestamp).toLocaleTimeString('en-US',
                 { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            
+
             entry.innerHTML = `
                 <span class="log-time">${time}</span>
                 <span class="log-type">${event.type || 'info'}</span>
                 <span class="log-msg">${formatEventData(event)}</span>
             `;
-            
+
             if (prepend) {
                 list.appendChild(entry);
             } else {
                 list.insertBefore(entry, list.firstChild);
             }
-            
+
             // Limit log entries
             while (list.children.length > 50) {
                 list.removeChild(list.lastChild);
@@ -345,7 +449,7 @@
                 case 'trade':
                     return `${d.action?.toUpperCase()} ${d.symbol} x${d.quantity} → ${d.result}`;
                 case 'cycle_complete':
-                    return `Cycle: ${d.decisions} decisions, ${(d.bought||[]).length} buys, ${(d.sold||[]).length} sells`;
+                    return `Cycle: ${d.decisions} decisions, ${(d.bought || []).length} buys, ${(d.sold || []).length} sells`;
                 case 'eod_review':
                     return `EOD: ${d.lessons_written} lessons, ${d.duplicates_removed} dupes removed`;
                 default:
@@ -357,7 +461,7 @@
         function setStatus(status, text) {
             const indicator = document.getElementById('status-indicator');
             const textEl = document.getElementById('status-text');
-            
+
             indicator.className = `status-indicator ${status}`;
             textEl.textContent = text;
         }
@@ -367,10 +471,10 @@
             document.querySelectorAll('.tab').forEach(tab => {
                 tab.addEventListener('click', () => {
                     const tabId = tab.dataset.tab;
-                    
+
                     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                    
+
                     tab.classList.add('active');
                     document.getElementById(`tab-${tabId}`).classList.add('active');
                 });
@@ -379,7 +483,7 @@
 
         // Clear log
         function clearLog() {
-            document.getElementById('log-list').innerHTML = 
+            document.getElementById('log-list').innerHTML =
                 '<div class="log-entry info">Log cleared</div>';
         }
 
@@ -389,12 +493,130 @@
             notification.className = `notification ${type}`;
             notification.textContent = msg;
             document.body.appendChild(notification);
-            
+
             setTimeout(() => notification.classList.add('show'), 10);
             setTimeout(() => {
                 notification.classList.remove('show');
                 setTimeout(() => notification.remove(), 300);
             }, 3000);
+        }
+
+        // Fetch Slider Status
+        async function fetchSliderStatus() {
+            try {
+                const res = await fetch('/api/slider/status');
+                if (res.ok) {
+                    const data = await res.json();
+                    updateSliderUI(data);
+                }
+            } catch (e) {
+                console.error("Failed to fetch slider status:", e);
+            }
+        }
+
+        // Update Slider UI
+        function updateSliderUI(data) {
+            const dashboard = document.getElementById('slider-dashboard');
+            dashboard.classList.remove('hidden');
+
+            // 1. Gauge & Header
+            const slider = data.slider || 0;
+            const fill = document.getElementById('slider-gauge-fill');
+            const val = document.getElementById('slider-value');
+
+            // Convert slider (-1 to 1) to degrees (-135 to 45) -> range 180 deg
+            // -1 -> -135deg (empty left)
+            // 1 -> 45deg (full right)
+            // Actually CSS setup: -135 is start (left), 45 is end (right)
+            // Wait, standard CSS gauge hack:
+            // mask is -45deg (top-left to top-right is hidden?)
+            // Let's assume -1 = 0% rotation, 1 = 180% rotation relative to base
+            // Based on CSS: .gauge-fill transform rotate(-135deg) is hidden start.
+            // We want to rotate FROM -135 TO +45. Range = 180deg.
+            // slider -1 -> -135
+            // slider 0 -> -45
+            // slider 1 -> 45
+            const deg = -45 + (slider * 90);
+            fill.style.transform = `rotate(${deg}deg)`;
+            fill.style.borderColor = slider > 0 ? 'var(--success)' : (slider < 0 ? 'var(--error)' : 'var(--text-muted)');
+
+            val.textContent = slider.toFixed(2);
+            val.style.color = slider > 0.1 ? 'var(--success)' : (slider < -0.1 ? 'var(--error)' : 'var(--text-primary)');
+
+            const actionBadge = document.getElementById('slider-action');
+            actionBadge.textContent = data.action || 'NEUTRAL';
+            actionBadge.className = `slider-action-badge ${slider > 0.1 ? 'buy' : (slider < -0.1 ? 'sell' : '')}`;
+
+            document.getElementById('market-price').textContent = `$${data.market?.current_price?.toFixed(2) || '--'}`;
+            document.getElementById('market-session').textContent = data.market?.session?.replace('_', ' ').toUpperCase() || '--';
+
+            const timeDate = new Date(data.timestamp);
+            lastSliderUpdate = timeDate;
+            // Immediate update of text
+            updateTime();
+
+            document.getElementById('slider-confidence').textContent = `${((data.confidence || 0) * 100).toFixed(0)}% Conf`;
+
+            // 2. Strategies
+            const stratList = document.getElementById('strategy-list');
+            stratList.innerHTML = (data.strategies || []).map(s => {
+                const sVal = s.slider || 0;
+                const color = sVal > 0 ? 'long' : (sVal < 0 ? 'short' : '');
+                const width = Math.abs(sVal) * 100;
+
+                return `
+                    <tr>
+                        <td style="font-weight: 500">${s.name}</td>
+                        <td style="width: 80px">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <div class="strategy-bar">
+                                    <div class="strategy-bar-fill ${color}" 
+                                         style="width: ${width}%; left: ${sVal < 0 ? 50 - width / 2 : 50}%; right: ${sVal > 0 ? 50 - width / 2 : 50}%;">
+                                    </div>
+                                    <!-- Simple bar logic: center is 0. 
+                                         Actually easier: 
+                                         long: left 50%, width 50% * val
+                                         short: right 50%, width 50% * val
+                                         Let's simplify: just show value text or custom bar -->
+                                </div>
+                                <span style="font-size: 11px; font-family: monospace;">${sVal.toFixed(2)}</span>
+                            </div>
+                        </td>
+                        <td style="color: var(--text-secondary); font-size: 11px;">${s.reasoning}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            // 3. Portfolio & Benchmarks
+            const port = data.portfolio || {};
+            document.getElementById('portfolio-value').textContent = `$${(port.total_value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+            const pnlLine = document.getElementById('portfolio-pnl');
+            const pnl = data.pnl || 0;
+            const pnlPct = data.pnl_pct || 0;
+            pnlLine.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString()} (${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
+            pnlLine.style.color = pnl >= 0 ? 'var(--success)' : 'var(--error)';
+
+            const benchList = document.getElementById('benchmark-list');
+            const benches = data.benchmarks || {};
+            // Add BOT to benchmarks list
+            let benchHTML = `
+                <div class="benchmark-row">
+                    <span class="benchmark-name" style="color: var(--accent-secondary)">BOT</span>
+                    <span class="benchmark-val ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</span>
+                </div>
+            `;
+
+            for (const [sym, b] of Object.entries(benches)) {
+                const ret = b.return_pct || 0;
+                benchHTML += `
+                    <div class="benchmark-row">
+                        <span class="benchmark-name">${sym}</span>
+                        <span class="benchmark-val ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</span>
+                    </div>
+                `;
+            }
+            benchList.innerHTML = benchHTML;
         }
 
         // Escape HTML
@@ -403,6 +625,40 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // Reset Slider Bot
+        async function resetSliderBot() {
+            if (!confirm('Reset all benchmarks and portfolio to $10,000?\n\nThis will:\n• Reset portfolio to $10,000 cash\n• Clear all benchmark tracking\n• Reset PnL to $0\n\nContinue?')) {
+                return;
+            }
+
+            const btn = document.getElementById('reset-button');
+            btn.disabled = true;
+            btn.textContent = 'Resetting...';
+
+            try {
+                const res = await fetch('/api/slider/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ capital: 10000 })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    showNotification('Reset complete! Starting fresh with $10,000', 'success');
+                    // Refresh slider status
+                    setTimeout(fetchSliderStatus, 500);
+                } else {
+                    showNotification(`Reset failed: ${data.error}`, 'error');
+                }
+            } catch (e) {
+                showNotification(`Reset error: ${e.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔄 Reset (Start Fresh)';
+            }
+        }
     </script>
 </body>
+
 </html>

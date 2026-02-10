@@ -10,6 +10,7 @@ Provides:
 import json
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -19,6 +20,8 @@ from flask import Flask, Response, jsonify, render_template, request
 from .event_bus import get_event_bus
 
 logger = logging.getLogger(__name__)
+
+SLIDER_STATUS_FILE = Path("kb/slider_status.json")
 
 # Shared state for trading bot integration
 _trading_state: Dict = {
@@ -69,7 +72,8 @@ def register_routes(app: Flask):
     @app.route('/')
     def dashboard():
         """Serve the main dashboard page."""
-        return render_template('dashboard.html')
+        state = get_trading_state()
+        return render_template('dashboard.html', ui_mode=state.get('mode', 'unknown'))
     
     @app.route('/api/status')
     def api_status():
@@ -162,7 +166,67 @@ def register_routes(app: Flask):
                 'error': str(e),
                 'traceback': tb,
             }), 500
+            return jsonify({
+                'success': False,
+                'error': str(e),
+                'traceback': tb,
+            }), 500
     
+    @app.route('/api/slider/status')
+    def api_slider_status():
+        """Get current slider bot status."""
+        try:
+            if SLIDER_STATUS_FILE.exists():
+                data = json.loads(SLIDER_STATUS_FILE.read_text())
+                return jsonify(data)
+            return jsonify({'error': 'No status file found'}), 404
+        except Exception as e:
+            logger.error(f"Error reading slider status: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/slider/reset', methods=['POST'])
+    def api_slider_reset():
+        """Reset slider bot - benchmarks, position, and PnL back to initial state."""
+        try:
+            # Get optional new capital from request
+            data = request.get_json() or {}
+            new_capital = data.get('capital', 10000.0)
+
+            with _state_lock:
+                slider_bot = _trading_state.get('slider_bot')
+
+            if slider_bot:
+                # Reset via bot instance
+                slider_bot.reset(new_capital)
+                logger.info(f"Slider bot reset via API. New capital: ${new_capital:,.2f}")
+                return jsonify({
+                    'success': True,
+                    'message': f'Reset complete. Starting capital: ${new_capital:,.2f}',
+                    'capital': new_capital,
+                })
+            else:
+                # No bot instance, just delete state files
+                from pathlib import Path
+                state_file = Path("benchmark_state.json")
+                history_file = Path("slider_history.json")
+
+                deleted = []
+                for f in [state_file, history_file, SLIDER_STATUS_FILE]:
+                    if f.exists():
+                        f.unlink()
+                        deleted.append(str(f))
+
+                logger.info(f"Slider reset (no bot): deleted {deleted}")
+                return jsonify({
+                    'success': True,
+                    'message': 'State files deleted. Bot will reinitialize on next cycle.',
+                    'deleted_files': deleted,
+                })
+
+        except Exception as e:
+            logger.error(f"Slider reset failed: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
     @app.route('/api/stream')
     def api_stream():
         """SSE endpoint for live updates."""
@@ -270,7 +334,37 @@ def run_server(
     """
     app = create_app()
     logger.info(f"Starting web dashboard at http://{host}:{port}")
+    
+    # Start slider file watcher
+    _start_slider_watcher()
+    
     app.run(host=host, port=port, debug=debug, threaded=threaded)
+
+
+def _start_slider_watcher():
+    """Start background thread to watch for slider status updates."""
+    def watch():
+        last_mtime = 0
+        while True:
+            try:
+                if SLIDER_STATUS_FILE.exists():
+                    mtime = SLIDER_STATUS_FILE.stat().st_mtime
+                    if mtime > last_mtime:
+                        last_mtime = mtime
+                        # Read and publish status
+                        try:
+                            data = json.loads(SLIDER_STATUS_FILE.read_text())
+                            get_event_bus().publish('slider_update', data)
+                        except Exception as e:
+                            logger.error(f"Error reading/publishing slider status: {e}")
+            except Exception as e:
+                logger.error(f"Slider watcher error: {e}")
+            
+            time.sleep(1.0)
+    
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    logger.info("Started slider status file watcher")
 
 
 def start_server_thread(
@@ -291,6 +385,9 @@ def start_server_thread(
         # Suppress Flask's default logging in production
         import logging as stdlib_logging
         stdlib_logging.getLogger('werkzeug').setLevel(stdlib_logging.WARNING)
+        
+        # Start slider watcher
+        _start_slider_watcher()
         
         app = create_app()
         app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)

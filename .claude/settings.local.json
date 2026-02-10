@@ -15,7 +15,8 @@
       "Bash(pip show:*)",
       "Bash(ls:*)",
       "Bash(python3:*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api-docs.deepseek.com)"
     ]
   }
 }

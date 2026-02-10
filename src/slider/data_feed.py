@@ -32,18 +32,31 @@ TIME_BUCKETS = [
 
 # Market session definitions (Eastern Time)
 # Each session: (start_hour, start_min, end_hour, end_min, name, character, kelly_fraction, strategies)
+# Note: overnight session wraps around midnight (20:00 -> 04:00)
 MARKET_SESSIONS = [
-    (4, 0, 9, 30, "pre_market", "Thin liquidity, gaps, news reactions", 0.25,
-     ["Gap Fade", "London Breakout"]),
+    (4, 0, 9, 30, "pre_market", "Thin liquidity, gaps, London Breakout aftermath", 0.25,
+     ["Gap Fade", "London Breakout", "Gap Quality Filter"]),
     (9, 30, 11, 0, "market_open", "High volatility, momentum, opening drives", 0.50,
-     ["Adaptive ORB", "Momentum"]),
+     ["Adaptive ORB", "Momentum", "Gap & Go"]),
     (11, 0, 14, 0, "lunch", "Low volatility, mean reversion, choppy", 0.10,
      ["TTM Squeeze", "Mean Reversion", "VWAP Mean Reversion"]),
     (14, 0, 16, 0, "power_hour", "Institutional flow, VWAP defense, MOC positioning", 0.50,
-     ["VWAP Hold", "MOC Flow"]),
-    (16, 0, 20, 0, "after_market", "Thin liquidity, earnings spikes", 0.25,
-     ["Liquidity Void Fill"]),
+     ["VWAP Hold", "MOC Flow", "Trend Continuation"]),
+    (16, 0, 20, 0, "after_market", "Thin liquidity, earnings spikes, liquidity voids", 0.25,
+     ["Liquidity Void Fill", "Earnings Fade"]),
+    # Overnight is special: 20:00-04:00 (wraps around midnight)
+    # We handle this with special logic in get_market_session()
 ]
+
+# Overnight session constants (wraps around midnight)
+OVERNIGHT_SESSION = {
+    "name": "overnight",
+    "start_hour": 20,
+    "end_hour": 4,  # Next day
+    "character": "Low volatility Asian session, range formation, London Breakout at 03:00",
+    "kelly_fraction": 0.10,  # Micro-size
+    "strategies": ["Asian Range", "London Breakout Prep", "Range Bound"],
+}
 
 
 def get_market_session() -> Dict:
@@ -51,7 +64,7 @@ def get_market_session() -> Dict:
     Get current market session based on time of day.
 
     Returns dict with:
-        - session_name: pre_market, market_open, lunch, power_hour, after_market, closed
+        - session_name: pre_market, market_open, lunch, power_hour, after_market, overnight
         - session_start: Start time string (HH:MM ET)
         - session_end: End time string (HH:MM ET)
         - session_character: Description of session behavior
@@ -62,8 +75,31 @@ def get_market_session() -> Dict:
     """
     et_tz = timezone('US/Eastern')
     now = datetime.now(et_tz)
+    current_hour = now.hour
     current_minutes = now.hour * 60 + now.minute
 
+    # Check for overnight session first (wraps around midnight: 20:00-04:00)
+    # Overnight is active if hour >= 20 OR hour < 4
+    if current_hour >= 20 or current_hour < 4:
+        if current_hour >= 20:
+            # Before midnight: minutes until 04:00 next day
+            mins_remaining = (24 - current_hour + 4) * 60 - now.minute
+        else:
+            # After midnight: minutes until 04:00
+            mins_remaining = (4 - current_hour) * 60 - now.minute
+        
+        return {
+            "session_name": OVERNIGHT_SESSION["name"],
+            "session_start": f"{OVERNIGHT_SESSION['start_hour']:02d}:00 ET",
+            "session_end": f"{OVERNIGHT_SESSION['end_hour']:02d}:00 ET",
+            "session_character": OVERNIGHT_SESSION["character"],
+            "kelly_fraction": OVERNIGHT_SESSION["kelly_fraction"],
+            "recommended_strategies": OVERNIGHT_SESSION["strategies"],
+            "minutes_remaining": mins_remaining,
+            "phase_specific_notes": _get_phase_notes("overnight"),
+        }
+
+    # Check regular sessions (04:00-20:00)
     for start_h, start_m, end_h, end_m, name, character, kelly, strategies in MARKET_SESSIONS:
         start_mins = start_h * 60 + start_m
         end_mins = end_h * 60 + end_m
@@ -81,22 +117,29 @@ def get_market_session() -> Dict:
                 "phase_specific_notes": _get_phase_notes(name),
             }
 
-    # Market closed (before 4am or after 8pm ET)
+    # This should not happen if overnight logic is correct, but fallback
     return {
-        "session_name": "closed",
-        "session_start": "N/A",
-        "session_end": "N/A",
-        "session_character": "Market closed",
-        "kelly_fraction": 0.0,
-        "recommended_strategies": [],
+        "session_name": "overnight",
+        "session_start": "20:00 ET",
+        "session_end": "04:00 ET",
+        "session_character": OVERNIGHT_SESSION["character"],
+        "kelly_fraction": OVERNIGHT_SESSION["kelly_fraction"],
+        "recommended_strategies": OVERNIGHT_SESSION["strategies"],
         "minutes_remaining": 0,
-        "phase_specific_notes": "Market is closed. No trading recommended.",
+        "phase_specific_notes": _get_phase_notes("overnight"),
     }
 
 
 def _get_phase_notes(session_name: str) -> str:
     """Get phase-specific trading notes."""
     notes = {
+        "overnight": (
+            "- Asian session (18:00-03:00 ET) defines support/resistance range\n"
+            "- London Breakout at 03:00 ET signals NY direction (70% accuracy)\n"
+            "- If London breaks Asian range, NY typically continues that direction\n"
+            "- Use Micro-Size (0.10f) - do not hold TQQQ/SQQQ overnight\n"
+            "- NQ futures preferred for overnight positioning"
+        ),
         "pre_market": (
             "- Wide spreads indicate fake breakouts; check spread before entry\n"
             "- London Breakout (03:00-04:00 ET) often predicts NY direction\n"

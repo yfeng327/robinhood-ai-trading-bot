@@ -22,7 +22,7 @@ from src.day_trading import DayTradingBot, DecisionBuffer
 from src.eod_review import EODReviewer, run_eod_review
 
 # Web UI imports (optional, only if --with-ui flag is used)
-WEB_UI_ENABLED = "--with-ui" in sys.argv
+WEB_UI_ENABLED = "--with-ui" in sys.argv or "--ui-only" in sys.argv
 if WEB_UI_ENABLED:
     from src.web import start_server_thread, set_trading_state, get_event_bus
     from src.web.event_bus import publish_cycle_complete, publish_eod_review
@@ -235,6 +235,18 @@ async def main():
     if MODE == "backtest":
         await run_backtest_mode()
         return
+
+    # Handle UI-only mode
+    if "--ui-only" in sys.argv:
+        logger.info("Starting in UI-Only mode (Slider Bot Dashboard)...")
+        if WEB_UI_ENABLED:
+            set_trading_state(mode="ui-only", running=True)
+            start_server_thread(host='0.0.0.0', port=5000)
+            logger.info("Web dashboard available at http://localhost:5000")
+            logger.info("Server running. Press Ctrl+C to stop.")
+            while True:
+                await asyncio.sleep(1)
+        return
     
     # Handle standalone EOD review
     if "--run-eod" in sys.argv:
@@ -347,6 +359,11 @@ if __name__ == '__main__':
         asyncio.run(main())
         sys.exit(0)
     
+    # Handle --ui-only: just run main (which handles it) without confirm
+    if "--ui-only" in sys.argv:
+        asyncio.run(main())
+        sys.exit(0)
+
     # Normal operation - confirm with user
     print(f"\n{'='*60}")
     print(f"Robinhood AI Trading Bot - {MODE.upper()} Mode")
@@ -356,6 +373,7 @@ if __name__ == '__main__':
     print(f"  - EOD Review: Runs at market close, writes to KB")
     print(f"\nOptions:")
     print(f"  --with-ui : Start web dashboard at http://localhost:5000")
+    print(f"  --ui-only : Start web dashboard ONLY (no trading loop)")
     print(f"  --run-eod : Run end-of-day review manually")
     print(f"  --kb-clean : Clean KB before starting")
     print(f"  --kb-clean-only : Clean KB and exit")

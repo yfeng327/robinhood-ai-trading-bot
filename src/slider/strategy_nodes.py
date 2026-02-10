@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 from src.api import ai
-from src.api import deepseek
 
 logger = logging.getLogger(__name__)
 
@@ -165,44 +164,32 @@ def run_gap_node(market_data: str, gap_info: str = "", **kwargs) -> Dict:
     return result
 
 
-def run_deepseek_node(market_data: str, **kwargs) -> Dict:
+def run_overnight_node(market_data: str, **kwargs) -> Dict:
     """
-    Run DeepSeek holistic analysis strategy.
-
-    Uses DeepSeek API directly (not the main AI provider).
-    Acts as an independent "second opinion" with deep reasoning.
+    Run Overnight strategy (Asian Range / London Breakout).
+    
+    Only active during overnight session (20:00-04:00 ET).
+    Returns neutral during regular market hours.
     """
-    logger.info("Running DeepSeek node...")
-
-    # Check if DeepSeek is configured
-    if not deepseek.is_deepseek_configured():
-        logger.warning("DeepSeek API key not configured, skipping node")
-        result = _default_output("DeepSeek not configured")
-        result["strategy"] = "deepseek"
-        return result
-
-    # Load prompt
-    prompt_template = _load_prompt("slider_deepseek.md")
-    if not prompt_template:
-        result = _default_output("Prompt file not found")
-        result["strategy"] = "deepseek"
-        return result
-
-    # Inject market data
-    prompt = prompt_template.replace("{market_data}", market_data)
-
-    logger.info(f"[slider_deepseek.md] Input prompt ({len(prompt)} chars)")
-    logger.debug(f"[slider_deepseek.md] Full prompt:\n{prompt}")
-
-    try:
-        raw = deepseek.make_deepseek_request(prompt)
-        logger.info(f"[slider_deepseek.md] DeepSeek response ({len(raw)} chars): {raw[:200]}...")
-        result = _parse_strategy_output(raw)
-    except Exception as e:
-        logger.error(f"DeepSeek strategy LLM failed: {e}")
-        result = _default_output(f"DeepSeek error: {e}")
-
-    result["strategy"] = "deepseek"
+    from .data_feed import get_market_session
+    
+    logger.info("Running Overnight node...")
+    
+    # Check if we're in overnight session
+    session = get_market_session()
+    if session["session_name"] != "overnight":
+        logger.info(f"Not in overnight session ({session['session_name']}), returning neutral")
+        return {
+            "slider": 0.0,
+            "confidence": 0.0,
+            "direction": "neutral",
+            "reasoning": f"Overnight strategy inactive during {session['session_name']} session",
+            "success": True,
+            "strategy": "overnight",
+        }
+    
+    result = _run_strategy_llm("slider_overnight.md", market_data)
+    result["strategy"] = "overnight"
     return result
 
 
@@ -236,7 +223,7 @@ def run_all_strategy_nodes(
             executor.submit(run_orb_node, market_data, opening_range): "orb",
             executor.submit(run_mean_reversion_node, market_data): "mean_reversion",
             executor.submit(run_gap_node, market_data, gap_info): "gap_trading",
-            executor.submit(run_deepseek_node, market_data): "deepseek",
+            executor.submit(run_overnight_node, market_data): "overnight",
         }
 
         for future in as_completed(futures):

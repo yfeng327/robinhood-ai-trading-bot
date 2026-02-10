@@ -16,10 +16,11 @@ from typing import Dict, List, Optional, Tuple
 from pytz import timezone
 
 from src.api import robinhood
-from .data_feed import QQQDataFeed
+from .data_feed import QQQDataFeed, get_market_session
 from .strategy_nodes import run_all_strategy_nodes
 from .synthesizer import synthesize_final_slider, format_slider_for_display
 from .kb_materializer import SliderKBWriter
+from .benchmark import BenchmarkTracker
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ class SliderBot:
         self.position = DemoPosition(cash=demo_pool)
         self.history = SliderHistory()
         self.kb_writer = SliderKBWriter()  # KB materialization
+        self.benchmark_tracker = BenchmarkTracker(initial_capital=demo_pool)  # Benchmark tracking
         
         self.current_slider = 0.0
         self.running = False
@@ -127,14 +129,17 @@ class SliderBot:
         logger.info(f"SliderBot initialized: ${demo_pool:,.0f} demo pool, {interval_seconds}s interval")
     
     def run(self):
-        """Main loop — run until market close or stopped."""
+        """Main loop — run until stopped."""
         self.running = True
         logger.info("SliderBot starting...")
         
         while self.running:
-            # Check if market is open
-            if not self._is_market_hours():
-                logger.info("Outside market hours, waiting...")
+            # Check if we're in a tradable session
+            session = get_market_session()
+            tradable, reason = self._is_tradable_hours(session)
+            
+            if not tradable:
+                logger.info(f"Not tradable: {reason}. Waiting 60s...")
                 time.sleep(60)
                 continue
             
@@ -143,9 +148,10 @@ class SliderBot:
             except Exception as e:
                 logger.error(f"Cycle error: {e}")
             
-            # Wait for next cycle
-            logger.info(f"Sleeping {self.interval_seconds} seconds until next cycle...")
-            time.sleep(self.interval_seconds)
+            # Dynamic interval based on session
+            interval = self._get_session_interval(session)
+            logger.info(f"[{session['session_name'].upper()}] Sleeping {interval}s until next cycle...")
+            time.sleep(interval)
         
         logger.info("SliderBot stopped")
     
@@ -172,33 +178,46 @@ class SliderBot:
             gap_info=gap_info_str,
         )
         
-        # 3. Synthesize final slider
-        market_summary = f"QQQ @ ${market_data['current_price']:.2f}"
-        synthesis = synthesize_final_slider(strategy_results, market_summary)
+        # 3. Update Benchmark Tracker
+        # Fetch current prices
+        qqq_price = market_data.get('current_price', 0)
+        tqqq_price = self._get_price(TQQQ_SYMBOL)
+        sqqq_price = self._get_price(SQQQ_SYMBOL)
+        voo_price = self._get_price("VOO")
+        
+        self.benchmark_tracker.update({
+            "TQQQ": tqqq_price,
+            "QQQ": qqq_price,
+            "VOO": voo_price
+        })
+
+        # 4. Synthesize final slider
+        # Pass full market data (same as strategies receive) for DeepSeek to analyze
+        synthesis = synthesize_final_slider(strategy_results, market_data_str)
         
         new_slider = synthesis.get("final_slider", 0.0)
         confidence = synthesis.get("confidence", 0.0)
         
         logger.info("\n" + format_slider_for_display(synthesis))
         
-        # 4. Check if rebalance needed
+        # 5. Check if rebalance needed
         slider_change = abs(new_slider - self.current_slider)
         
         if slider_change >= self.min_slider_change:
             logger.info(f"Slider change {slider_change:.2f} >= threshold, rebalancing...")
-            self._rebalance(new_slider, market_data)
+            self._rebalance(new_slider, tqqq_price, sqqq_price)
             self.current_slider = new_slider
         else:
             logger.info(f"Slider change {slider_change:.2f} < threshold, holding position")
         
-        # 5. Calculate current PnL
-        tqqq_price = self._get_price(TQQQ_SYMBOL)
-        sqqq_price = self._get_price(SQQQ_SYMBOL)
+        # 6. Calculate current PnL and Compare
+        # Use valid prices fetched earlier
         total_value = self.position.get_total_value(tqqq_price, sqqq_price)
         pnl = total_value - self.demo_pool
         pnl_pct = (pnl / self.demo_pool) * 100
         
-        logger.info(f"Demo Portfolio: ${total_value:,.2f} (PnL: ${pnl:+,.2f} / {pnl_pct:+.2f}%)")
+        # Log Performance Comparison
+        logger.info("\n" + self.benchmark_tracker.format_comparison(total_value))
         
         # 6. Save to history
         self.history.add(
@@ -218,10 +237,19 @@ class SliderBot:
                 synthesis_result=synthesis,
                 current_price=market_data.get('current_price', 0),
                 action_taken=action_taken,
+                bot_pnl_pct=pnl_pct,
+                benchmark_data=self.benchmark_tracker.get_performance(),
+                sqqq_price=sqqq_price,
             )
         except Exception as e:
             logger.warning(f"KB materialization failed: {e}")
         
+        # 8. Write status file for UI
+        self._write_status_file(
+            cycle_start, new_slider, confidence, pnl, pnl_pct, 
+            total_value, market_data, strategy_results, synthesis
+        )
+
         return {
             "timestamp": cycle_start.isoformat(),
             "slider": new_slider,
@@ -231,17 +259,69 @@ class SliderBot:
             "total_value": total_value,
         }
     
-    def _rebalance(self, target_slider: float, market_data: Dict):
+    def _write_status_file(
+        self, timestamp: datetime, slider: float, confidence: float,
+        pnl: float, pnl_pct: float, total_value: float,
+        market_data: Dict, strategy_results: Dict, synthesis: Dict
+    ):
+        """Write current status to JSON for UI consumption."""
+        try:
+            status_file = Path("kb/slider_status.json")
+            status_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Format strategies list
+            strategies = []
+            for name, res in strategy_results.items():
+                if not res.get("success"): continue
+                strategies.append({
+                    "name": name,
+                    "slider": res.get("slider", 0),
+                    "confidence": res.get("confidence", 0),
+                    "reasoning": res.get("reasoning", "")[:100] + "..." if len(res.get("reasoning", "")) > 100 else res.get("reasoning", ""),
+                    "direction": res.get("direction", "neutral")
+                })
+            
+            # Get benchmarks
+            benchmarks = self.benchmark_tracker.get_performance()
+            
+            data = {
+                "timestamp": timestamp.isoformat(),
+                "slider": slider,
+                "confidence": confidence,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "portfolio": {
+                    "tqqq_shares": self.position.tqqq_shares,
+                    "sqqq_shares": self.position.sqqq_shares,
+                    "cash": self.position.cash,
+                    "total_value": total_value,
+                },
+                "market": {
+                    "current_price": market_data.get("current_price", 0),
+                    # Get session directly from data_feed if possible, or re-fetch
+                    "session": get_market_session()["session_name"]
+                },
+                "strategies": strategies,
+                "benchmarks": benchmarks,
+                "action": self._infer_action(slider),
+                "agreement": synthesis.get("strategy_agreement", 0),
+            }
+            
+            with open(status_file, 'w') as f:
+                json.dump(data, f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Failed to write status file: {e}")
+    
+    def _rebalance(self, target_slider: float, tqqq_price: float, sqqq_price: float):
         """
         Rebalance demo portfolio to match target slider.
-        
+
         Args:
             target_slider: Target slider (-1 to +1)
-            market_data: Current market data
+            tqqq_price: Current TQQQ price
+            sqqq_price: Current SQQQ price
         """
-        tqqq_price = self._get_price(TQQQ_SYMBOL)
-        sqqq_price = self._get_price(SQQQ_SYMBOL)
-        
         if tqqq_price <= 0 or sqqq_price <= 0:
             logger.error("Cannot rebalance: invalid prices")
             return
@@ -298,24 +378,122 @@ class SliderBot:
             logger.warning(f"Failed to get price for {symbol}: {e}")
             return 0.0
     
-    def _is_market_hours(self) -> bool:
-        """Check if currently in market hours."""
+    def _is_tradable_hours(self, session: Dict = None) -> Tuple[bool, str]:
+        """
+        Check if currently in tradable hours (including extended hours).
+        
+        Returns:
+            Tuple of (is_tradable, reason)
+        """
         now = datetime.now(self.et_tz)
         
-        # Weekday check
+        # Weekend check
         if now.weekday() >= 5:  # Saturday or Sunday
-            return False
+            return False, "Weekend - markets closed"
         
-        # Time check (9:30 AM - 4:00 PM ET)
-        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        # All sessions are tradable (overnight, pre_market, market_open, etc.)
+        # Only 'closed' session is not tradable, but we've eliminated that
+        if session is None:
+            session = get_market_session()
         
-        return market_open <= now <= market_close
+        session_name = session.get('session_name', 'unknown')
+        
+        # All known sessions are tradable
+        if session_name in ['overnight', 'pre_market', 'market_open', 'lunch', 'power_hour', 'after_market']:
+            return True, f"In {session_name} session"
+        
+        return False, f"Unknown session: {session_name}"
+    
+    def _get_session_interval(self, session: Dict) -> int:
+        """
+        Get appropriate poll interval based on current session.
+        
+        - Overnight: 15 min (900s) - slow mode
+        - Pre/After Market: 10 min (600s)
+        - Regular hours: 5 min (300s) or configured interval
+        """
+        session_name = session.get('session_name', 'market_open')
+        
+        if session_name == 'overnight':
+            return 900  # 15 minutes
+        elif session_name in ['pre_market', 'after_market']:
+            return 600  # 10 minutes
+        else:
+            return self.interval_seconds  # Default (5 min)
     
     def stop(self):
         """Stop the bot."""
         self.running = False
         logger.info("Stop requested")
+
+    def reset(self, new_capital: float = None):
+        """
+        Reset the bot to initial state.
+
+        - Resets demo position to cash only
+        - Resets benchmark tracker and immediately initializes with current prices
+        - Clears slider history
+        - Updates status file
+
+        Args:
+            new_capital: Optional new starting capital (default: DEMO_POOL_SIZE)
+        """
+        capital = new_capital if new_capital is not None else DEMO_POOL_SIZE
+
+        # Reset position
+        self.position = DemoPosition(cash=capital)
+        self.demo_pool = capital
+        self.current_slider = 0.0
+
+        # Reset benchmark tracker
+        self.benchmark_tracker.reset(capital)
+
+        # Immediately initialize benchmarks with current prices so returns start at 0%
+        qqq_price = 0
+        try:
+            tqqq_price = self._get_price(TQQQ_SYMBOL)
+            qqq_price = self._get_price("QQQ")
+            voo_price = self._get_price("VOO")
+
+            if tqqq_price > 0 and qqq_price > 0 and voo_price > 0:
+                self.benchmark_tracker.initialize({
+                    "TQQQ": tqqq_price,
+                    "QQQ": qqq_price,
+                    "VOO": voo_price,
+                })
+                # Update with same prices so current_price matches start_price
+                self.benchmark_tracker.update({
+                    "TQQQ": tqqq_price,
+                    "QQQ": qqq_price,
+                    "VOO": voo_price,
+                })
+                logger.info(f"Benchmarks initialized at TQQQ=${tqqq_price:.2f}, QQQ=${qqq_price:.2f}, VOO=${voo_price:.2f}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize benchmarks on reset: {e}")
+
+        # Clear history
+        self.history = SliderHistory()
+        if self.history_path.exists():
+            try:
+                self.history_path.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to delete history file: {e}")
+
+        # Write fresh status file
+        now = datetime.now(self.et_tz)
+        self._write_status_file(
+            timestamp=now,
+            slider=0.0,
+            confidence=0.0,
+            pnl=0.0,
+            pnl_pct=0.0,
+            total_value=capital,
+            market_data={'current_price': qqq_price},
+            strategy_results={},
+            synthesis={'strategy_agreement': 0}
+        )
+
+        logger.info(f"SliderBot reset complete. Capital: ${capital:,.2f}")
     
     def get_status(self) -> Dict:
         """Get current bot status."""
@@ -354,22 +532,36 @@ class SliderBot:
             return "NEUTRAL"
 
 
-def run_demo(dry_run: bool = False):
+def run_demo(dry_run: bool = False, with_ui: bool = True):
     """Run the slider bot in demo mode."""
     import sys
-    
+
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
+
     # Login to Robinhood
     logger.info("Logging in to Robinhood...")
     robinhood.login_to_robinhood()
-    
+
     bot = SliderBot()
-    
+
+    # Start web UI and register bot for API access
+    if with_ui:
+        try:
+            from src.web import start_server_thread, set_trading_state
+            set_trading_state(
+                mode="slider",
+                running=True,
+                slider_bot=bot,  # Register for reset API
+            )
+            start_server_thread(host='0.0.0.0', port=5000)
+            logger.info("Web dashboard available at http://localhost:5000")
+        except ImportError:
+            logger.warning("Web UI not available")
+
     if dry_run:
         logger.info("DRY RUN: Running single cycle only")
         result = bot.run_cycle()
@@ -385,10 +577,11 @@ def run_demo(dry_run: bool = False):
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="TQQQ/SQQQ Slider Bot")
     parser.add_argument("--demo", action="store_true", help="Run in demo mode (no real trades)")
     parser.add_argument("--dry-run", action="store_true", help="Run single cycle and exit")
+    parser.add_argument("--no-ui", action="store_true", help="Disable web UI")
     args = parser.parse_args()
-    
-    run_demo(dry_run=args.dry_run)
+
+    run_demo(dry_run=args.dry_run, with_ui=not args.no_ui)

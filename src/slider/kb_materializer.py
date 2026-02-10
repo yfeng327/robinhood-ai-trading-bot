@@ -4,15 +4,19 @@ Slider KB Materializer — Writes slider decisions to knowledge base.
 Creates/appends to kb/sessions/{date}/slider_decisions.md with:
 1. Decision log table (compact view of all strategies + final slider)
 2. Strategy reasoning table (detailed reasoning from each strategy)
+
+Uses LLM to compress reasoning fields to ≤80 characters while preserving key signals.
 """
 
-import os
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from pytz import timezone
+
+from src.api import ai
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +36,21 @@ class SliderKBWriter:
         synthesis_result: Dict,
         current_price: float,
         action_taken: str = "",
+        bot_pnl_pct: float = 0.0,
+        benchmark_data: Optional[Dict[str, Dict]] = None,
+        sqqq_price: float = 0.0,
     ):
         """
         Append one slider decision cycle to the KB.
-        
+
         Args:
             strategy_results: Dict mapping strategy name to result dict
             synthesis_result: Dict with final_slider, confidence, reasoning
             current_price: Current QQQ price
             action_taken: Description of action taken (e.g., "BUY TQQQ 30%")
+            bot_pnl_pct: Bot's current P/L percentage
+            benchmark_data: Dict with benchmark performance {symbol: {return_pct: float, price: float}}
+            sqqq_price: Current SQQQ price
         """
         now = datetime.now(self.et_tz)
         date_str = now.strftime("%Y-%m-%d")
@@ -56,23 +66,49 @@ class SliderKBWriter:
         if not file_path.exists() or self._current_date != date_str:
             self._initialize_file(file_path, date_str)
             self._current_date = date_str
-        
+
+        # Get synthesis reasoning for compression
+        synthesis_reasoning = synthesis_result.get('reasoning', '')
+        compressed_synthesis_reason = ""
+
+        if synthesis_reasoning and len(synthesis_reasoning) > 80:
+            # Compress synthesis reasoning along with strategy reasonings
+            compressed = self._compress_reasonings_batch({'synthesis': synthesis_reasoning})
+            compressed_synthesis_reason = compressed.get('synthesis', synthesis_reasoning[:77] + "...")
+        elif synthesis_reasoning:
+            compressed_synthesis_reason = synthesis_reasoning
+
         # Append decision log row
         decision_row = self._format_decision_row(
-            time_str, strategy_results, synthesis_result, action_taken
+            time_str, strategy_results, synthesis_result, action_taken,
+            compressed_synthesis_reason
         )
-        
+
         # Append strategy reasoning rows
         reasoning_rows = self._format_reasoning_rows(time_str, strategy_results)
-        
+
+        # Append asset track row
+        asset_track_row = ""
+        if benchmark_data:
+            asset_track_row = self._format_asset_track_row(
+                time_str, synthesis_result.get('final_slider', 0), bot_pnl_pct, benchmark_data, sqqq_price
+            )
+
         # Read current content to find insertion points
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         # Insert decision row after Decision Log table header
         content = self._insert_after_marker(
-            content, "| Time | TTM | ORB | MeanRev | Gap | Final | Conf | Action |", decision_row
+            content, "| Time | TTM | ORB | MeanRev | Gap | Final | Conf | Action | Synthesis Reason |", decision_row
         )
+        
+        
+        # Insert asset track row after Asset Track table header
+        if asset_track_row:
+            content = self._insert_after_marker(
+                content, "| Time | Slider | Bot P/L | QQQ | QQQ $ | VOO | VOO $ | TQQQ | TQQQ $ | SQQQ $ |", asset_track_row
+            )
         
         # Insert reasoning rows after Strategy Reasoning table header
         for row in reasoning_rows:
@@ -97,8 +133,12 @@ class SliderKBWriter:
 - **Max Bearish:** 0.00
 
 ## Decision Log
-| Time | TTM | ORB | MeanRev | Gap | Final | Conf | Action |
-|------|-----|-----|---------|-----|-------|------|--------|
+| Time | TTM | ORB | MeanRev | Gap | Final | Conf | Action | Synthesis Reason |
+|------|-----|-----|---------|-----|-------|------|--------|------------------|
+
+## Asset Track
+| Time | Slider | Bot P/L | QQQ | QQQ $ | VOO | VOO $ | TQQQ | TQQQ $ | SQQQ $ |
+|------|--------|---------|-----|-------|-----|-------|------|--------|--------|
 
 ## Strategy Reasoning
 | Time | Strategy | Slider | Conf | Reasoning |
@@ -109,7 +149,7 @@ class SliderKBWriter:
 """
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        
+
         logger.info(f"Initialized slider decisions file: {file_path}")
     
     def _format_decision_row(
@@ -117,7 +157,8 @@ class SliderKBWriter:
         time_str: str,
         strategy_results: Dict[str, Dict],
         synthesis_result: Dict,
-        action_taken: str
+        action_taken: str,
+        compressed_synthesis_reason: str = ""
     ) -> str:
         """Format one row for the decision log table."""
         def fmt_strategy(name: str) -> str:
@@ -126,19 +167,22 @@ class SliderKBWriter:
             conf = r.get('confidence', 0)
             sign = '+' if slider > 0 else ''
             return f"{sign}{slider:.1f} ({conf:.0%})"
-        
+
         ttm = fmt_strategy('ttm_squeeze')
         orb = fmt_strategy('orb')
         mean_rev = fmt_strategy('mean_reversion')
         gap = fmt_strategy('gap_trading')
-        
+
         final = synthesis_result.get('final_slider', 0)
         conf = synthesis_result.get('confidence', 0)
         final_str = f"{'+' if final > 0 else ''}{final:.2f}"
-        
+
         action = action_taken or self._infer_action(final)
-        
-        return f"| {time_str} | {ttm} | {orb} | {mean_rev} | {gap} | {final_str} | {conf:.0%} | {action} |"
+
+        # Escape pipe characters in synthesis reason
+        reason = compressed_synthesis_reason.replace('|', '\\|') if compressed_synthesis_reason else "-"
+
+        return f"| {time_str} | {ttm} | {orb} | {mean_rev} | {gap} | {final_str} | {conf:.0%} | {action} | {reason} |"
     
     def _format_reasoning_rows(
         self,
@@ -152,27 +196,141 @@ class SliderKBWriter:
             'orb': 'ORB',
             'mean_reversion': 'Mean Reversion',
             'gap_trading': 'Gap Trading',
+            'overnight': 'Overnight',
         }
-        
+
+        # Collect reasonings that need compression
+        reasonings_to_compress = {}
+        for key in strategy_names:
+            r = strategy_results.get(key, {})
+            reasoning = r.get('reasoning', 'No reasoning provided')
+            if len(reasoning) > 80:
+                reasonings_to_compress[key] = reasoning
+
+        # Batch compress with LLM if any need compression
+        compressed = {}
+        if reasonings_to_compress:
+            compressed = self._compress_reasonings_batch(reasonings_to_compress)
+
         for key, display_name in strategy_names.items():
             r = strategy_results.get(key, {})
             slider = r.get('slider', 0)
             conf = r.get('confidence', 0)
             reasoning = r.get('reasoning', 'No reasoning provided')
-            
-            # Truncate reasoning to fit in table
-            if len(reasoning) > 80:
+
+            # Use compressed version if available, else truncate
+            if key in compressed:
+                reasoning = compressed[key]
+            elif len(reasoning) > 80:
+                # Fallback: naive truncation
                 reasoning = reasoning[:77] + "..."
-            
+
             # Escape pipe characters in reasoning
             reasoning = reasoning.replace('|', '\\|')
-            
+
             sign = '+' if slider > 0 else ''
             rows.append(
                 f"| {time_str} | {display_name} | {sign}{slider:.2f} | {conf:.0%} | {reasoning} |"
             )
-        
+
         return rows
+
+    def _format_asset_track_row(
+        self,
+        time_str: str,
+        slider_val: float,
+        bot_pnl_pct: float,
+        benchmark_data: Dict[str, Dict],
+        sqqq_price: float = 0.0
+    ) -> str:
+        """Format one row for the asset track table with prices and percentages."""
+        slider_str = f"{'+' if slider_val > 0 else ''}{slider_val:.2f}"
+        bot_pnl_str = f"{'+' if bot_pnl_pct > 0 else ''}{bot_pnl_pct:.2f}%"
+
+        def get_bench_pct(symbol: str) -> str:
+            data = benchmark_data.get(symbol, {})
+            val = data.get('return_pct', 0.0)
+            return f"{'+' if val > 0 else ''}{val:.2f}%"
+
+        def get_bench_price(symbol: str) -> str:
+            data = benchmark_data.get(symbol, {})
+            price = data.get('price', 0.0)
+            return f"${price:.2f}"
+
+        qqq_pct = get_bench_pct('QQQ')
+        qqq_price = get_bench_price('QQQ')
+        voo_pct = get_bench_pct('VOO')
+        voo_price = get_bench_price('VOO')
+        tqqq_pct = get_bench_pct('TQQQ')
+        tqqq_price = get_bench_price('TQQQ')
+        sqqq_price_str = f"${sqqq_price:.2f}"
+
+        return f"| {time_str} | {slider_str} | {bot_pnl_str} | {qqq_pct} | {qqq_price} | {voo_pct} | {voo_price} | {tqqq_pct} | {tqqq_price} | {sqqq_price_str} |"
+
+    def _compress_reasonings_batch(self, reasonings: Dict[str, str]) -> Dict[str, str]:
+        """
+        Use LLM to compress multiple reasoning strings to ≤80 characters.
+
+        Args:
+            reasonings: Dict mapping strategy key to full reasoning string
+
+        Returns:
+            Dict mapping strategy key to compressed reasoning (≤80 chars)
+        """
+        if not reasonings:
+            return {}
+
+        # Build prompt for batch compression
+        prompt = """Compress each trading strategy reasoning to ≤80 characters.
+Preserve: direction (bullish/bearish/neutral), key indicator, confidence signal.
+Drop: verbose explanations, redundant words.
+
+Input reasonings:
+"""
+        for key, text in reasonings.items():
+            prompt += f"\n{key}: {text}"
+
+        prompt += """
+
+Output JSON only:
+{"strategy_key": "compressed reasoning ≤80 chars", ...}
+
+Rules:
+- Each compressed string MUST be ≤80 characters
+- Use abbreviations: RSI, VWAP, BB=Bollinger, MR=mean reversion, ORB=opening range
+- Keep the core signal: bullish/bearish + why
+"""
+
+        try:
+            response = ai.make_ai_request(prompt)
+            raw = ai.get_raw_response_content(response)
+
+            # Parse JSON response
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+
+            result = json.loads(cleaned)
+
+            # Validate each compression is ≤80 chars
+            validated = {}
+            for key, compressed in result.items():
+                if key in reasonings and isinstance(compressed, str):
+                    if len(compressed) <= 80:
+                        validated[key] = compressed
+                    else:
+                        # LLM didn't respect limit, truncate
+                        validated[key] = compressed[:77] + "..."
+
+            logger.debug(f"Compressed {len(validated)}/{len(reasonings)} reasonings via LLM")
+            return validated
+
+        except Exception as e:
+            logger.warning(f"LLM reasoning compression failed: {e}")
+            return {}
     
     def _infer_action(self, final_slider: float) -> str:
         """Infer action description from final slider value."""
