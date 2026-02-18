@@ -5,18 +5,15 @@ Creates/appends to kb/sessions/{date}/slider_decisions.md with:
 1. Decision log table (compact view of all strategies + final slider)
 2. Strategy reasoning table (detailed reasoning from each strategy)
 
-Uses LLM to compress reasoning fields to ≤80 characters while preserving key signals.
+Strategy prompts are configured to output ≤80 char reasoning with abbreviations.
 """
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from pytz import timezone
-
-from src.api import ai
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +64,11 @@ class SliderKBWriter:
             self._initialize_file(file_path, date_str)
             self._current_date = date_str
 
-        # Get synthesis reasoning for compression
+        # Get synthesis reasoning (strategy prompts output ≤80 chars, fallback truncate)
         synthesis_reasoning = synthesis_result.get('reasoning', '')
-        compressed_synthesis_reason = ""
-
-        if synthesis_reasoning and len(synthesis_reasoning) > 80:
-            # Compress synthesis reasoning along with strategy reasonings
-            compressed = self._compress_reasonings_batch({'synthesis': synthesis_reasoning})
-            compressed_synthesis_reason = compressed.get('synthesis', synthesis_reasoning[:77] + "...")
-        elif synthesis_reasoning:
+        if len(synthesis_reasoning) > 80:
+            compressed_synthesis_reason = synthesis_reasoning[:77] + "..."
+        else:
             compressed_synthesis_reason = synthesis_reasoning
 
         # Append decision log row
@@ -189,7 +182,11 @@ class SliderKBWriter:
         time_str: str,
         strategy_results: Dict[str, Dict]
     ) -> list:
-        """Format reasoning rows for each strategy."""
+        """Format reasoning rows for each strategy.
+
+        Strategy prompts are configured to output ≤80 char reasoning with abbreviations.
+        Fallback truncation if a strategy exceeds limit.
+        """
         rows = []
         strategy_names = {
             'ttm_squeeze': 'TTM Squeeze',
@@ -199,30 +196,14 @@ class SliderKBWriter:
             'overnight': 'Overnight',
         }
 
-        # Collect reasonings that need compression
-        reasonings_to_compress = {}
-        for key in strategy_names:
-            r = strategy_results.get(key, {})
-            reasoning = r.get('reasoning', 'No reasoning provided')
-            if len(reasoning) > 80:
-                reasonings_to_compress[key] = reasoning
-
-        # Batch compress with LLM if any need compression
-        compressed = {}
-        if reasonings_to_compress:
-            compressed = self._compress_reasonings_batch(reasonings_to_compress)
-
         for key, display_name in strategy_names.items():
             r = strategy_results.get(key, {})
             slider = r.get('slider', 0)
             conf = r.get('confidence', 0)
             reasoning = r.get('reasoning', 'No reasoning provided')
 
-            # Use compressed version if available, else truncate
-            if key in compressed:
-                reasoning = compressed[key]
-            elif len(reasoning) > 80:
-                # Fallback: naive truncation
+            # Fallback truncation if strategy exceeded 80 char limit
+            if len(reasoning) > 80:
                 reasoning = reasoning[:77] + "..."
 
             # Escape pipe characters in reasoning
@@ -267,71 +248,6 @@ class SliderKBWriter:
 
         return f"| {time_str} | {slider_str} | {bot_pnl_str} | {qqq_pct} | {qqq_price} | {voo_pct} | {voo_price} | {tqqq_pct} | {tqqq_price} | {sqqq_price_str} |"
 
-    def _compress_reasonings_batch(self, reasonings: Dict[str, str]) -> Dict[str, str]:
-        """
-        Use LLM to compress multiple reasoning strings to ≤80 characters.
-
-        Args:
-            reasonings: Dict mapping strategy key to full reasoning string
-
-        Returns:
-            Dict mapping strategy key to compressed reasoning (≤80 chars)
-        """
-        if not reasonings:
-            return {}
-
-        # Build prompt for batch compression
-        prompt = """Compress each trading strategy reasoning to ≤80 characters.
-Preserve: direction (bullish/bearish/neutral), key indicator, confidence signal.
-Drop: verbose explanations, redundant words.
-
-Input reasonings:
-"""
-        for key, text in reasonings.items():
-            prompt += f"\n{key}: {text}"
-
-        prompt += """
-
-Output JSON only:
-{"strategy_key": "compressed reasoning ≤80 chars", ...}
-
-Rules:
-- Each compressed string MUST be ≤80 characters
-- Use abbreviations: RSI, VWAP, BB=Bollinger, MR=mean reversion, ORB=opening range
-- Keep the core signal: bullish/bearish + why
-"""
-
-        try:
-            response = ai.make_ai_request(prompt)
-            raw = ai.get_raw_response_content(response)
-
-            # Parse JSON response
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            cleaned = cleaned.strip()
-
-            result = json.loads(cleaned)
-
-            # Validate each compression is ≤80 chars
-            validated = {}
-            for key, compressed in result.items():
-                if key in reasonings and isinstance(compressed, str):
-                    if len(compressed) <= 80:
-                        validated[key] = compressed
-                    else:
-                        # LLM didn't respect limit, truncate
-                        validated[key] = compressed[:77] + "..."
-
-            logger.debug(f"Compressed {len(validated)}/{len(reasonings)} reasonings via LLM")
-            return validated
-
-        except Exception as e:
-            logger.warning(f"LLM reasoning compression failed: {e}")
-            return {}
-    
     def _infer_action(self, final_slider: float) -> str:
         """Infer action description from final slider value."""
         if final_slider > 0.5:

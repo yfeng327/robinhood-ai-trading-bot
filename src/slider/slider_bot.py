@@ -17,7 +17,7 @@ from pytz import timezone
 
 from src.api import robinhood
 from .data_feed import QQQDataFeed, get_market_session
-from .strategy_nodes import run_all_strategy_nodes
+from .strategy_nodes import run_strategy_nodes
 from .synthesizer import synthesize_final_slider, format_slider_for_display
 from .kb_materializer import SliderKBWriter
 from .benchmark import BenchmarkTracker
@@ -171,11 +171,15 @@ class SliderBot:
         opening_range_str = self.data_feed.format_opening_range(market_data)
         gap_info_str = self.data_feed.format_gap_info(market_data)
         
-        # 2. Run all strategy nodes concurrently
-        strategy_results = run_all_strategy_nodes(
+        # 2. Run strategy nodes concurrently
+        import config
+        strategy_results = run_strategy_nodes(
             market_data=market_data_str,
-            opening_range=opening_range_str,
-            gap_info=gap_info_str,
+            extra_context={
+                "opening_range": opening_range_str,
+                "gap_info": gap_info_str,
+            },
+            active_strategies=config.ACTIVE_STRATEGIES,
         )
         
         # 3. Update Benchmark Tracker
@@ -198,7 +202,7 @@ class SliderBot:
         new_slider = synthesis.get("final_slider", 0.0)
         confidence = synthesis.get("confidence", 0.0)
         
-        logger.info("\n" + format_slider_for_display(synthesis))
+        logger.info("\n" + format_slider_for_display(synthesis, total_strategies=len(strategy_results)))
         
         # 5. Check if rebalance needed
         slider_change = abs(new_slider - self.current_slider)
@@ -369,10 +373,42 @@ class SliderBot:
         logger.info(f"[DEMO] Rebalance complete: {tqqq_target_shares:.4f} TQQQ, {sqqq_target_shares:.4f} SQQQ")
     
     def _get_price(self, symbol: str) -> float:
-        """Get current price for symbol."""
+        """Get current price for symbol with 3-tier resolution.
+
+        Price resolution order (outside regular hours):
+        1. last_extended_hours_trade_price (available ~4:00-20:00 ET)
+        2. bid/ask midpoint (available during 24hr market for eligible ETFs)
+        3. last_trade_price (regular session close — final fallback)
+
+        During regular hours (09:30-16:00), uses last_trade_price directly.
+        """
         try:
             import robin_stocks.robinhood as rh
             quote = rh.stocks.get_stock_quote_by_symbol(symbol)
+
+            # Check if we're in extended hours
+            now = datetime.now(self.et_tz)
+            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+            is_extended_hours = now < market_open or now > market_close
+
+            if is_extended_hours:
+                # Tier 1: Extended hours trade price (works ~4:00-20:00 ET)
+                extended_price = quote.get('last_extended_hours_trade_price')
+                if extended_price:
+                    price = float(extended_price)
+                    if price > 0:
+                        return price
+
+                # Tier 2: Bid/ask midpoint (24hr market may keep bid/ask alive)
+                bid = float(quote.get('bid_price', 0) or 0)
+                ask = float(quote.get('ask_price', 0) or 0)
+                if bid > 0 and ask > 0:
+                    midpoint = (bid + ask) / 2
+                    logger.debug(f"{symbol} using bid/ask midpoint ${midpoint:.2f} (bid=${bid:.2f}, ask=${ask:.2f})")
+                    return midpoint
+
+            # Tier 3 / Regular hours: last trade price
             return float(quote.get('last_trade_price', 0))
         except Exception as e:
             logger.warning(f"Failed to get price for {symbol}: {e}")

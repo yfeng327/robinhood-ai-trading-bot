@@ -162,7 +162,7 @@ def _simple_weighted_average(strategy_results: Dict[str, Dict]) -> Dict:
     }
 
 
-def format_slider_for_display(result: Dict) -> str:
+def format_slider_for_display(result: Dict, total_strategies: int = 0) -> str:
     """Format synthesizer result for logging/display."""
     slider = result.get("final_slider", 0)
     conf = result.get("confidence", 0)
@@ -189,5 +189,5 @@ def format_slider_for_display(result: Dict) -> str:
         f"Final Slider: {slider:+.2f} ({direction})\n"
         f"Confidence: {conf:.0%}\n"
         f"Regime: {regime}\n"
-        f"Strategy Agreement: {agreement}/5"
+        f"Strategy Agreement: {agreement}/{total_strategies or agreement}"
     )

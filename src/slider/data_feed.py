@@ -14,8 +14,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from pytz import timezone
 
-import robin_stocks.robinhood as rh
-from src.api import robinhood
+from src.api.market_data import (
+    get_current_quote,
+    get_intraday_bars,
+    get_daily_bars,
+    calculate_all_indicators,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,38 +141,38 @@ def _get_phase_notes(session_name: str) -> str:
             "- Asian session (18:00-03:00 ET) defines support/resistance range\n"
             "- London Breakout at 03:00 ET signals NY direction (70% accuracy)\n"
             "- If London breaks Asian range, NY typically continues that direction\n"
-            "- Use Micro-Size (0.10f) - do not hold TQQQ/SQQQ overnight\n"
+            "- Use Half-Kelly (0.5f) - do not hold TQQQ/SQQQ overnight\n"
             "- NQ futures preferred for overnight positioning"
         ),
         "pre_market": (
             "- Wide spreads indicate fake breakouts; check spread before entry\n"
             "- London Breakout (03:00-04:00 ET) often predicts NY direction\n"
             "- Gap Quality = (Volume / Avg) × (1 / Spread)\n"
-            "- Use Quarter-Kelly (0.25f) sizing due to thin liquidity"
+            "- Use Full Kelly (1.0f) sizing for high-conviction setups"
         ),
         "market_open": (
             "- VIX-adjusted ORB: High VIX = 2-5 min bars, Low VIX = 30 min bars\n"
             "- Use Fibonacci pullback entries (50%/61.8%) instead of chasing breakouts\n"
             "- TICK > 1000 signals institutional drive\n"
-            "- Use Half-Kelly (0.5f) sizing for high-conviction setups"
+            "- Use Full Kelly (1.0f) sizing for high-conviction setups"
         ),
         "lunch": (
             "- Tighten Bollinger Bands from 2.0 to 1.5 SD (lower volatility)\n"
             "- VWAP mean reversion is dominant strategy\n"
             "- Avoid momentum plays; favor mean reversion\n"
-            "- Use Micro-Size (0.1f) - this is the worst time for directional bets"
+            "- Use Half-Kelly (0.5f) - this is the worst time for directional bets"
         ),
         "power_hour": (
             "- MOC imbalances at 15:50 ET predict close direction\n"
             "- Institutions defend VWAP aggressively\n"
             "- Lunch ambiguity resolves with directional break\n"
-            "- Use Half-Kelly (0.5f) for trend continuation plays"
+            "- Use Full Kelly (1.0f) sizing for high-conviction setups"
         ),
         "after_market": (
             "- Thin liquidity creates volatile moves on earnings\n"
             "- Liquidity void fills are common\n"
             "- Wide spreads = higher slippage risk\n"
-            "- Use Quarter-Kelly (0.25f) due to execution risk"
+            "-Use Full Kelly (1.0f) sizing for high-conviction setups"
         ),
     }
     return notes.get(session_name, "No specific notes for this session.")
@@ -206,52 +210,36 @@ class QQQDataFeed:
             return self._empty_data()
     
     def _fetch_all_data(self) -> Dict:
-        """Fetch all required data from Robinhood."""
+        """Fetch all required data via market_data module."""
         symbol = REFERENCE_SYMBOL
         now = datetime.now(self.et_tz)
-        
-        # Get current quote
-        try:
-            quotes = rh.stocks.get_stock_quote_by_symbol(symbol)
-            current_price = float(quotes.get('last_trade_price', 0))
-            bid = float(quotes.get('bid_price', 0) or 0)
-            ask = float(quotes.get('ask_price', 0) or 0)
-        except Exception as e:
-            logger.warning(f"Quote fetch failed: {e}")
-            current_price, bid, ask = 0, 0, 0
-        
-        # Get intraday 5-min bars
-        try:
-            historicals_day = rh.stocks.get_stock_historicals(
-                symbol, interval='5minute', span='day', bounds='regular'
-            )
-        except Exception as e:
-            logger.warning(f"Intraday data fetch failed: {e}")
-            historicals_day = []
-        
-        # Get previous day data for gap calculation
-        try:
-            historicals_week = rh.stocks.get_stock_historicals(
-                symbol, interval='day', span='week', bounds='regular'
-            )
-            prev_day = historicals_week[-2] if len(historicals_week) >= 2 else None
-            today = historicals_week[-1] if historicals_week else None
-        except Exception as e:
-            logger.warning(f"Daily data fetch failed: {e}")
-            prev_day, today = None, None
-        
-        # Build decaying resolution table
-        intraday_table = self._build_decaying_table(historicals_day, now)
-        
-        # Calculate indicators (if we have data)
-        indicators = self._calculate_indicators(historicals_day)
-        
+
+        # Get current quote (3-tier price resolution handled in market_data)
+        quote = get_current_quote(symbol)
+        current_price = quote.get('price', 0)
+        bid = quote.get('bid', 0)
+        ask = quote.get('ask', 0)
+
+        # Get intraday 5-min bars (with extended hours for pre-market data)
+        intraday_bars = get_intraday_bars(symbol, extended=True)
+
+        # Get daily bars for gap/prev day calculation
+        daily_bars = get_daily_bars(symbol)
+        prev_day = daily_bars[-2] if len(daily_bars) >= 2 else None
+        today = daily_bars[-1] if daily_bars else None
+
+        # Build decaying resolution table from parsed bars
+        intraday_table = self._build_decaying_table_from_parsed(intraday_bars, now)
+
+        # Calculate ALL indicators (14+) from bar data
+        indicators = calculate_all_indicators(intraday_bars, quote)
+
         # Gap info
-        gap_info = self._calculate_gap_info(prev_day, today, historicals_day)
-        
+        gap_info = self._calculate_gap_info(prev_day, today, intraday_bars)
+
         # Opening range (first 15 mins)
-        opening_range = self._calculate_opening_range(historicals_day)
-        
+        opening_range = self._calculate_opening_range(intraday_bars)
+
         return {
             "symbol": symbol,
             "current_price": current_price,
@@ -262,37 +250,32 @@ class QQQDataFeed:
             "indicators": indicators,
             "gap_info": gap_info,
             "opening_range": opening_range,
-            "prev_day_close": float(prev_day['close_price']) if prev_day else None,
-            "today_open": float(today['open_price']) if today else None,
+            "prev_day_close": prev_day['close'] if prev_day else None,
+            "today_open": today['open'] if today else None,
         }
     
-    def _build_decaying_table(self, bars: List, now: datetime) -> str:
+    def _build_decaying_table_from_parsed(self, bars: List[Dict], now: datetime) -> str:
         """
         Build markdown table with decaying time resolution.
         
         Recent data = high resolution, older data = aggregated.
+        Bars are already parsed dicts with 'time', 'open', 'high', 'low', 'close', 'volume'.
         """
         if not bars:
             return "No intraday data available"
         
-        # Parse all bars with timestamps
-        parsed = []
-        for bar in bars:
-            try:
-                ts = datetime.fromisoformat(bar['begins_at'].replace('Z', '+00:00'))
-                ts_et = ts.astimezone(self.et_tz)
-                parsed.append({
-                    'time': ts_et,
-                    'open': float(bar['open_price']),
-                    'high': float(bar['high_price']),
-                    'low': float(bar['low_price']),
-                    'close': float(bar['close_price']),
-                    'volume': int(bar['volume']),
-                })
-            except Exception:
-                continue
+        # Filter to regular hours for the table display
+        regular_bars = [
+            b for b in bars
+            if (b['time'].hour > 9 or (b['time'].hour == 9 and b['time'].minute >= 30))
+            and b['time'].hour < 16
+        ]
         
-        if not parsed:
+        if not regular_bars:
+            # Fall back to all bars if no regular hours bars
+            regular_bars = bars
+        
+        if not regular_bars:
             return "No valid bars"
         
         # Aggregate into buckets based on age
@@ -301,7 +284,7 @@ class QQQDataFeed:
             cutoff_start = now - timedelta(hours=hours_end)
             cutoff_end = now - timedelta(hours=hours_start)
             
-            bucket_bars = [b for b in parsed if cutoff_start <= b['time'] < cutoff_end]
+            bucket_bars = [b for b in regular_bars if cutoff_start <= b['time'] < cutoff_end]
             if not bucket_bars:
                 continue
             
@@ -358,105 +341,40 @@ class QQQDataFeed:
         
         return aggregated
     
-    def _calculate_indicators(self, bars: List) -> Dict:
-        """Calculate technical indicators from bar data."""
-        if not bars or len(bars) < 14:
-            return {}
-        
-        closes = [float(b['close_price']) for b in bars]
-        volumes = [int(b['volume']) for b in bars]
-        
-        # Simple RSI calculation
-        rsi = self._calculate_rsi(closes, period=14)
-        rsi_2 = self._calculate_rsi(closes, period=2) if len(closes) >= 3 else None
-        
-        # VWAP (simplified - sum of price*vol / sum of vol)
-        vwap = self._calculate_vwap(bars)
-        
-        # Moving averages
-        sma_20 = sum(closes[-20:]) / min(20, len(closes)) if closes else None
-        sma_50 = sum(closes[-50:]) / min(50, len(closes)) if len(closes) >= 20 else None
-        
-        # Average volume
-        avg_volume = sum(volumes) / len(volumes) if volumes else 0
-        current_volume = volumes[-1] if volumes else 0
-        rvol = current_volume / avg_volume if avg_volume > 0 else 1.0
-        
-        # Simple ATR approximation (average of high-low)
-        highs = [float(b['high_price']) for b in bars]
-        lows = [float(b['low_price']) for b in bars]
-        atr = sum(h - l for h, l in zip(highs[-14:], lows[-14:])) / min(14, len(bars))
-        
-        return {
-            "rsi_14": round(rsi, 1) if rsi else None,
-            "rsi_2": round(rsi_2, 1) if rsi_2 else None,
-            "vwap": round(vwap, 2) if vwap else None,
-            "sma_20": round(sma_20, 2) if sma_20 else None,
-            "sma_50": round(sma_50, 2) if sma_50 else None,
-            "rvol": round(rvol, 2),
-            "atr": round(atr, 2) if atr else None,
-            "current_volume": current_volume,
-            "avg_volume": int(avg_volume),
-        }
-    
-    def _calculate_rsi(self, prices: List[float], period: int = 14) -> Optional[float]:
-        """Calculate RSI from price series."""
-        if len(prices) < period + 1:
-            return None
-        
-        changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-        gains = [max(0, c) for c in changes[-period:]]
-        losses = [abs(min(0, c)) for c in changes[-period:]]
-        
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        
-        if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-    
-    def _calculate_vwap(self, bars: List) -> Optional[float]:
-        """Calculate VWAP from bar data."""
-        if not bars:
-            return None
-        
-        total_pv = 0
-        total_vol = 0
-        
-        for bar in bars:
-            typical = (float(bar['high_price']) + float(bar['low_price']) + float(bar['close_price'])) / 3
-            vol = int(bar['volume'])
-            total_pv += typical * vol
-            total_vol += vol
-        
-        return total_pv / total_vol if total_vol > 0 else None
+    # NOTE: _calculate_indicators, _calculate_rsi, _calculate_vwap removed.
+    # All indicator computation is now in src.api.market_data.calculate_all_indicators()
     
     def _calculate_gap_info(self, prev_day: Dict, today: Dict, intraday: List) -> Dict:
-        """Calculate gap information for gap trading strategy."""
+        """Calculate gap information for gap trading strategy.
+        
+        Args use parsed bar format: {'open': float, 'high': float, 'low': float, 'close': float, ...}
+        """
         if not prev_day or not today:
             return {"gap_exists": False}
         
-        prev_close = float(prev_day['close_price'])
-        today_open = float(today['open_price'])
+        prev_close = prev_day['close']
+        today_open = today['open']
         gap = today_open - prev_close
         gap_pct = (gap / prev_close) * 100
         
         # Estimate ATR from prev day range
-        prev_range = float(prev_day['high_price']) - float(prev_day['low_price'])
+        prev_range = prev_day['high'] - prev_day['low']
         gap_atr_multiple = abs(gap) / prev_range if prev_range > 0 else 0
         
-        # First 5-min candle info
-        first_candle = intraday[0] if intraday else None
+        # First 5-min candle info (filter to regular hours)
+        regular_bars = [
+            b for b in intraday
+            if b['time'].hour > 9 or (b['time'].hour == 9 and b['time'].minute >= 30)
+        ]
+        first_candle = regular_bars[0] if regular_bars else None
         first_candle_info = None
         if first_candle:
-            body = abs(float(first_candle['close_price']) - float(first_candle['open_price']))
-            range_ = float(first_candle['high_price']) - float(first_candle['low_price'])
+            body = abs(first_candle['close'] - first_candle['open'])
+            range_ = first_candle['high'] - first_candle['low']
             body_pct = (body / range_ * 100) if range_ > 0 else 0
             first_candle_info = {
                 "body_pct": round(body_pct, 1),
-                "volume": int(first_candle['volume']),
+                "volume": first_candle['volume'],
                 "is_doji": body_pct < 20,
             }
         
@@ -472,21 +390,28 @@ class QQQDataFeed:
         }
     
     def _calculate_opening_range(self, intraday: List) -> Dict:
-        """Calculate opening range (first 15 minutes)."""
+        """Calculate opening range (first 15 minutes).
+        
+        Uses parsed bar format: {'time': datetime, 'open': float, 'high': float, ...}
+        """
         if not intraday:
             return {"or_defined": False}
         
-        # First 3 bars = first 15 minutes (5-min bars)
-        or_bars = intraday[:3]
+        # Filter to regular hours bars, take first 3 (= first 15 min of 5-min bars)
+        regular_bars = [
+            b for b in intraday
+            if b['time'].hour > 9 or (b['time'].hour == 9 and b['time'].minute >= 30)
+        ]
+        or_bars = regular_bars[:3]
         if len(or_bars) < 3:
             return {"or_defined": False}
         
-        or_high = max(float(b['high_price']) for b in or_bars)
-        or_low = min(float(b['low_price']) for b in or_bars)
+        or_high = max(b['high'] for b in or_bars)
+        or_low = min(b['low'] for b in or_bars)
         or_width = or_high - or_low
         
         # Current price position relative to OR
-        current = float(intraday[-1]['close_price']) if intraday else None
+        current = regular_bars[-1]['close'] if regular_bars else None
         position = "inside"
         if current:
             if current > or_high:
@@ -542,14 +467,87 @@ class QQQDataFeed:
 
         ind = data.get('indicators', {})
         if ind:
+            # Core indicators
             lines.extend([
                 f"- RSI(14): {ind.get('rsi_14', 'N/A')}",
                 f"- RSI(2): {ind.get('rsi_2', 'N/A')}",
                 f"- VWAP: ${ind.get('vwap', 'N/A')}",
                 f"- SMA(20): ${ind.get('sma_20', 'N/A')}",
+                f"- SMA(50): ${ind.get('sma_50', 'N/A')}",
+                f"- EMA(9): ${ind.get('ema_9', 'N/A')}",
+                f"- EMA(20): ${ind.get('ema_20', 'N/A')}",
+                f"- ATR(14): ${ind.get('atr', 'N/A')}",
                 f"- Relative Volume: {ind.get('rvol', 'N/A')}x average",
-                f"- ATR: ${ind.get('atr', 'N/A')}",
+                f"- ADX(14): {ind.get('adx', 'N/A')}",
             ])
+
+            # Bollinger Bands
+            if ind.get('bb_upper'):
+                lines.extend([
+                    "",
+                    "**Bollinger Bands (20,2):**",
+                    f"- BB Upper: ${ind['bb_upper']}",
+                    f"- BB Middle: ${ind.get('bb_middle', 'N/A')}",
+                    f"- BB Lower: ${ind.get('bb_lower', 'N/A')}",
+                    f"- BB Width: {ind.get('bb_width', 'N/A')}",
+                ])
+
+            # Keltner Channels
+            if ind.get('kc_upper'):
+                lines.extend([
+                    "",
+                    "**Keltner Channels (EMA20, 1.5×ATR):**",
+                    f"- KC Upper: ${ind['kc_upper']}",
+                    f"- KC Middle: ${ind.get('kc_middle', 'N/A')}",
+                    f"- KC Lower: ${ind.get('kc_lower', 'N/A')}",
+                ])
+
+            # Squeeze detection
+            if ind.get('squeeze_on') is not None:
+                squeeze_str = "🔴 ON (BB inside KC)" if ind['squeeze_on'] else "🟢 OFF (BB outside KC)"
+                lines.append(f"- TTM Squeeze: {squeeze_str}")
+
+            # VWAP Z-Score
+            if ind.get('vwap_zscore') is not None:
+                lines.extend([
+                    "",
+                    "**VWAP Statistics:**",
+                    f"- VWAP Z-Score: {ind['vwap_zscore']}",
+                    f"- VWAP Std Dev: ${ind.get('vwap_std', 'N/A')}",
+                ])
+
+            # SMA Slopes
+            if ind.get('sma_20_slope') is not None:
+                lines.extend([
+                    "",
+                    "**Trend Slopes (% per bar):**",
+                    f"- SMA(20) Slope: {ind['sma_20_slope']}",
+                    f"- SMA(50) Slope: {ind.get('sma_50_slope', 'N/A')}",
+                ])
+
+            # Price Range
+            if ind.get('today_hod'):
+                lines.extend([
+                    "",
+                    "**Price Range:**",
+                    f"- HOD: ${ind['today_hod']}",
+                    f"- LOD: ${ind.get('today_lod', 'N/A')}",
+                ])
+            if ind.get('premarket_high'):
+                lines.extend([
+                    f"- Pre-Market High: ${ind['premarket_high']}",
+                    f"- Pre-Market Low: ${ind.get('premarket_low', 'N/A')}",
+                ])
+
+            # Market Microstructure
+            if ind.get('spread') is not None:
+                lines.extend([
+                    "",
+                    "**Market Microstructure:**",
+                    f"- Bid-Ask Spread: ${ind['spread']}",
+                    f"- Spread %: {ind.get('spread_pct', 'N/A')}%",
+                    f"- Consecutive Direction: {ind.get('consec_direction', 0)} bars",
+                ])
 
         return "\n".join(lines)
     

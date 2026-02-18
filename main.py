@@ -13,6 +13,7 @@ import sys
 import time
 from datetime import datetime
 import asyncio
+from pytz import timezone
 
 from config import *
 from src.api import robinhood
@@ -71,29 +72,30 @@ eod_reviewer = EODReviewer(
 # ============================================================================
 
 def is_market_open() -> bool:
-    """Check if US stock market is currently open."""
-    now = datetime.now()
-    
+    """Check if US stock market is currently open (Eastern Time)."""
+    eastern = timezone('US/Eastern')
+    now = datetime.now(eastern)
+
     # Weekend check (0=Monday, 6=Sunday)
     if now.weekday() >= 5:
         return False
-    
-    # Market hours: 9:30 AM - 4:00 PM EST
-    # Note: This is simplified; real implementation should handle timezones
+
+    # Market hours: 9:30 AM - 4:00 PM ET
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    
+
     return market_open <= now <= market_close
 
 
 def is_market_close() -> bool:
-    """Check if we're at market close (4:00 PM)."""
-    now = datetime.now()
-    
-    # Check if current time is between 4:00 PM and 4:05 PM
+    """Check if we're at market close (4:00 PM ET)."""
+    eastern = timezone('US/Eastern')
+    now = datetime.now(eastern)
+
+    # Check if current time is between 4:00 PM and 4:05 PM ET
     close_start = now.replace(hour=16, minute=0, second=0, microsecond=0)
     close_end = now.replace(hour=16, minute=5, second=0, microsecond=0)
-    
+
     return close_start <= now <= close_end
 
 
